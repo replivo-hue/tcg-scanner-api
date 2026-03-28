@@ -191,63 +191,10 @@ After searching, respond with ONLY this JSON structure (no markdown, no explanat
 If a source has no data, set "available": false and all prices to null.`;
 
   try {
-    const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
-
-    // Agentic loop — Claude may call web_search multiple times before final answer
-    let messages = [{ role: 'user', content: userPrompt }];
-    let finalText = '';
-    let iterations = 0;
-    const MAX_ITER = 8;
-
-    while (iterations < MAX_ITER) {
-      iterations++;
-      const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 4000,
-        system: systemPrompt,
-        tools,
-        messages
-      });
-
-      // Collect any text from this turn
-      const textBlocks = response.content.filter(b => b.type === 'text');
-      if (textBlocks.length) finalText = textBlocks.map(b => b.text).join('');
-
-      // If model is done, break
-      if (response.stop_reason === 'end_turn') break;
-
-      // If model wants to use tools, feed results back and continue
-      if (response.stop_reason === 'tool_use') {
-        const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
-        if (!toolUseBlocks.length) break;
-
-        // Add assistant message with tool calls
-        messages.push({ role: 'assistant', content: response.content });
-
-        // Add tool results (web search results come back automatically via the SDK)
-        const toolResults = toolUseBlocks.map(b => ({
-          type: 'tool_result',
-          tool_use_id: b.id,
-          content: 'Search completed. Use the results from the search to populate the price data.'
-        }));
-        messages.push({ role: 'user', content: toolResults });
-        continue;
-      }
-
-      break;
-    }
+    const finalText = await agenticSearch(systemPrompt, userPrompt, 8);
 
     // Parse the final JSON response
-    let prices;
-    try {
-      const cleaned = finalText.replace(/```json|```/g, '').trim();
-      // Extract JSON object if there's surrounding text
-      const match = cleaned.match(/\{[\s\S]*\}/);
-      prices = match ? JSON.parse(match[0]) : null;
-    } catch (e) {
-      console.error('JSON parse error:', e.message, '\nRaw:', finalText.slice(0, 500));
-      prices = null;
-    }
+    let prices = parseJSON(finalText);
 
     // Fallback if parsing failed
     if (!prices) {
@@ -268,7 +215,168 @@ If a source has no data, set "available": false and all prices to null.`;
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: POST /generate-listing
+// HELPER: agentic web search loop
+// ═════════════════════════════════════════════════════════════════════════════
+async function agenticSearch(systemPrompt, userPrompt, maxIter = 10) {
+  const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+  let messages = [{ role: 'user', content: userPrompt }];
+  let finalText = '';
+
+  for (let i = 0; i < maxIter; i++) {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 4000,
+      system: systemPrompt,
+      tools,
+      messages
+    });
+
+    const textBlocks = response.content.filter(b => b.type === 'text');
+    if (textBlocks.length) finalText = textBlocks.map(b => b.text).join('');
+
+    if (response.stop_reason === 'end_turn') break;
+
+    if (response.stop_reason === 'tool_use') {
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      if (!toolUseBlocks.length) break;
+      messages.push({ role: 'assistant', content: response.content });
+      const toolResults = toolUseBlocks.map(b => ({
+        type: 'tool_result',
+        tool_use_id: b.id,
+        content: 'Search completed. Use the results to answer the question.'
+      }));
+      messages.push({ role: 'user', content: toolResults });
+      continue;
+    }
+    break;
+  }
+
+  return finalText;
+}
+
+function parseJSON(text) {
+  try {
+    const cleaned = text.replace(/```json|```/g, '').trim();
+    const match = cleaned.match(/[\[{][\s\S]*[\]}]/);
+    return match ? JSON.parse(match[0]) : null;
+  } catch { return null; }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ROUTE: POST /variants
+// Body: { card: { name, game, set, number, rarity } }
+// Returns: array of all known set versions with avg prices
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/variants', async (req, res) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+  if (!checkRate(ip)) return res.status(429).json({ error: 'Too many requests.' });
+
+  const { card } = req.body;
+  if (!card?.name) return res.status(400).json({ error: 'No card data provided.' });
+
+  const cacheKey = `variants:${card.name}:${card.game}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json({ ...cached, cached: true });
+
+  try {
+    // Step 1 — find all sets this card appeared in
+    const setsText = await agenticSearch(
+      `You are a trading card game expert. Search for all versions of a card across every set it appeared in. Respond ONLY with a JSON array — no markdown, no explanation.`,
+      `Search for every set and version that "${card.name}" (${card.game}) has appeared in.
+
+Search: "${card.name} ${card.game} all sets versions printings"
+
+Return a JSON array of every known version:
+[
+  {
+    "set": "Base Set",
+    "year": "1999",
+    "number": "4/102",
+    "rarity": "Rare Holo",
+    "variant": "Shadowless",
+    "ebayQuery": "Charizard Base Set Shadowless Holo Rare 4/102"
+  },
+  {
+    "set": "Base Set 2",
+    "year": "2000", 
+    "number": "4/130",
+    "rarity": "Rare Holo",
+    "variant": null,
+    "ebayQuery": "Charizard Base Set 2 Holo Rare 4/130"
+  }
+]
+
+Include ALL printings: different sets, promos, alternate arts, 1st edition, unlimited, shadowless, etc.
+Keep the array to a maximum of 15 most notable/valuable versions.`,
+      8
+    );
+
+    let versions = parseJSON(setsText);
+    if (!Array.isArray(versions) || !versions.length) {
+      return res.json({ variants: [], error: 'Could not find variant data.' });
+    }
+
+    // Step 2 — fetch eBay AU avg price for each version in parallel (max 8 at once)
+    const BATCH = 8;
+    const results = [];
+
+    for (let i = 0; i < Math.min(versions.length, 15); i += BATCH) {
+      const batch = versions.slice(i, i + BATCH);
+      const pricePromises = batch.map(async (v) => {
+        const vCacheKey = `vprice:${card.name}:${v.set}:${v.variant || ''}`;
+        const vCached = cacheGet(vCacheKey);
+        if (vCached) return { ...v, ...vCached };
+
+        try {
+          const priceText = await agenticSearch(
+            `You are a trading card price researcher. Search eBay Australia sold listings and respond ONLY with JSON — no markdown.`,
+            `Search eBay Australia sold listings for: "${v.ebayQuery || `${card.name} ${v.set}`}"
+
+Find recent sold prices on ebay.com.au for this exact card version.
+
+Respond with ONLY this JSON (no markdown):
+{
+  "low": 5.00,
+  "avg": 10.00,
+  "high": 18.00,
+  "salesCount": 3,
+  "currency": "AUD",
+  "available": true
+}
+If no sales found set available: false and all prices to null.`,
+            5
+          );
+
+          const priceData = parseJSON(priceText) || { available: false, low: null, avg: null, high: null, currency: 'AUD' };
+          cacheSet(vCacheKey, priceData);
+          return { ...v, ...priceData };
+        } catch {
+          return { ...v, available: false, low: null, avg: null, high: null, currency: 'AUD' };
+        }
+      });
+
+      const batchResults = await Promise.all(pricePromises);
+      results.push(...batchResults);
+    }
+
+    // Sort by avg price descending (most valuable first), unavailable last
+    results.sort((a, b) => {
+      if (!a.available && b.available) return 1;
+      if (a.available && !b.available) return -1;
+      return (b.avg || 0) - (a.avg || 0);
+    });
+
+    const payload = { variants: results };
+    cacheSet(cacheKey, payload);
+    return res.json(payload);
+
+  } catch (err) {
+    console.error('variants error:', err.message);
+    return res.status(500).json({ error: err.message || 'Variant lookup failed.' });
+  }
+});
+
+
 // Body: { card, prices, condition, askingPrice }
 // Returns: { title, description }
 // ═════════════════════════════════════════════════════════════════════════════
