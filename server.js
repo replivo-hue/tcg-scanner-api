@@ -27,9 +27,11 @@ async function initRedis() {
   const url = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL;
   if (!url) { console.log('[cache] No REDIS_URL — using in-memory'); return; }
   try {
-    const { createClient } = require('redis');
+    let createClient;
+    try { createClient = require('redis').createClient; }
+    catch { console.log('[cache] redis package not installed — using in-memory'); return; }
     redisClient = createClient({ url });
-    redisClient.on('error', e => console.error('[redis]', e.message));
+    redisClient.on('error', e => { console.error('[redis]', e.message); redisClient = null; });
     await redisClient.connect();
     console.log('[cache] Redis connected');
   } catch (e) {
@@ -253,7 +255,9 @@ If cannot identify: {"error":"Cannot identify card"}`
     }));
 
     const raw  = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
-    const card = JSON.parse(raw);
+    let card;
+    try { card = JSON.parse(raw); }
+    catch { card = parseJSON(raw) || { error: 'Could not parse card data — try again.' }; }
     if (!card.error) await cacheSet(cacheKey, card, ID_TTL);
     return res.json(card);
   } catch (err) {
