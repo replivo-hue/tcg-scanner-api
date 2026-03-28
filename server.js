@@ -71,6 +71,8 @@ app.post('/identify', async (req, res) => {
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
       max_tokens: 400,
       messages: [{
         role: 'user',
