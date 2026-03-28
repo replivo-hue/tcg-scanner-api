@@ -72,8 +72,8 @@ app.post('/identify', async (req, res) => {
 
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 400,
+      model: 'claude-sonnet-4-6',
+      max_tokens: 600,
       messages: [{
         role: 'user',
         content: [
@@ -83,23 +83,32 @@ app.post('/identify', async (req, res) => {
           },
           {
             type: 'text',
-            text: `You are an expert trading card identifier. Analyse this image and respond ONLY with valid JSON — no markdown, no explanation.
+            text: `You are an expert trading card identifier. Your job is to READ THE EXACT TEXT printed on this card — do not guess or rely on memory.
+
+IMPORTANT RULES:
+- Read the card number exactly as printed (e.g. "120/124" not "151/165")
+- Read the set name exactly as printed at the bottom of the card
+- Read the card name exactly as printed at the top
+- Do NOT confuse similar cards — check the number and set carefully
+- If the card number is visible, always include it
+
+Respond ONLY with valid JSON — no markdown, no explanation.
 
 If you can identify the card:
 {
-  "name": "exact full card name",
+  "name": "exact card name as printed",
   "game": "Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other",
-  "set": "set or expansion name",
-  "number": "card number or null",
-  "rarity": "rarity or null",
+  "set": "exact set name as printed on card",
+  "number": "exact card number as printed (e.g. 120/124)",
+  "rarity": "rarity as printed or inferred from symbol",
   "year": "year printed or null",
   "condition": "Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played",
   "foil": true or false,
   "extra": "1st Edition / Shadowless / PSA graded / etc — or null",
   "confidence": "high | medium | low",
-  "tcgplayerQuery": "best search query for TCGPlayer",
-  "ebayQuery": "best search query for eBay sold listings",
-  "cardmarketQuery": "best search query for Cardmarket"
+  "tcgplayerQuery": "card name + set name + number for TCGPlayer search",
+  "ebayQuery": "card name + set name + number for eBay search",
+  "cardmarketQuery": "card name + set name for Cardmarket search"
 }
 
 If you cannot identify it:
