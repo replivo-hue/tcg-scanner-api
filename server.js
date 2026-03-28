@@ -225,68 +225,23 @@ async function lookupLorcana(card) {
   } catch (e) { console.log('[lorcana lookup]', e.message); return null; }
 }
 
-// ── PriceCharting public search — works without API key, covers ALL TCGs ─────
-// Returns ungraded/loose price (closest to raw card market value)
-async function lookupPriceCharting(card) {
-  try {
-    const q = [card.name, card.set, card.number].filter(Boolean).join(' ');
-    const url = `https://www.pricecharting.com/api/product?q=${encodeURIComponent(q)}&type=prices`;
-    const r = await httpGet(url, { 'Accept': 'application/json' });
-    if (r.status !== 200) return null;
-    const data = JSON.parse(r.body);
-    // Response is either a single product or has a products array
-    const item = data.status === 'success' ? data :
-                 (data.products && data.products[0]) || null;
-    if (!item || item.status === 'error') return null;
-
-    // Prices are in cents — convert to dollars
-    // loose-price = ungraded market value (best for raw cards)
-    const loosePrice = item['loose-price'];
-    const market = (typeof loosePrice === 'number' && loosePrice > 0)
-      ? loosePrice / 100 : null;
-
-    console.log(`[pricecharting] found: ${item['product-name']} = $${market}`);
-    return {
-      imageUrl:  null, // PriceCharting doesn't serve card images
-      tcgmarket: market,
-      tcglow:    null,
-      tcghigh:   null,
-      currency:  'USD',
-      source:    'PriceCharting'
-    };
-  } catch (e) { console.log('[pricecharting]', e.message); return null; }
+// ── PriceCharting — build a direct search URL for the card
+// Their API requires a paid subscription token so we can't call it directly.
+// Instead we return a search URL so the user can tap through to see the price.
+function buildPriceChartingUrl(card) {
+  const parts = [card.name, card.set, card.number].filter(Boolean);
+  const q = encodeURIComponent(parts.join(' '));
+  return `https://www.pricecharting.com/search-products?q=${q}&type=prices&sort=popularity&broad-category=trading-cards`;
 }
 
-// Master lookup — tries primary API then PriceCharting as universal fallback
+// Master lookup — primary TCG API per game
 async function lookupCard(card) {
   const game = (card.game || '').toLowerCase();
-  let result = null;
-
-  if (game.includes('pokemon'))                              result = await lookupPokemon(card);
-  else if (game.includes('magic'))                           result = await lookupScryfall(card);
-  else if (game.includes('yu-gi-oh') || game.includes('yugioh')) result = await lookupYGO(card);
-  else if (game.includes('lorcana'))                         result = await lookupLorcana(card);
-  else                                                       result = await lookupScryfall(card);
-
-  // If primary lookup found a price, use it (even if no image)
-  if (result?.tcgmarket != null) return result;
-
-  // Primary had no price — try PriceCharting as universal fallback
-  const pc = await lookupPriceCharting(card);
-  if (pc) {
-    // Merge: keep image from primary lookup if we got one, use PC price
-    return {
-      imageUrl:  result?.imageUrl || null,
-      tcgmarket: pc.tcgmarket,
-      tcglow:    null,
-      tcghigh:   null,
-      currency:  'USD',
-      source:    pc.source
-    };
-  }
-
-  // Return whatever primary found (may just have image, no price)
-  return result;
+  if (game.includes('pokemon'))                                   return lookupPokemon(card);
+  if (game.includes('magic'))                                     return lookupScryfall(card);
+  if (game.includes('yu-gi-oh') || game.includes('yugioh'))      return lookupYGO(card);
+  if (game.includes('lorcana'))                                   return lookupLorcana(card);
+  return lookupScryfall(card);
 }
 
 // ─── Card number verification ────────────────────────────────────────────────
@@ -358,48 +313,87 @@ app.post('/identify', async (req, res) => {
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
   const len = imageBase64.length;
-  const cKey = 'id5:' + imageBase64.slice(0,16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
+  const cKey = 'id6:' + imageBase64.slice(0,16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
   const cached = await cacheGet(cKey);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
-    const response = await withRetry(() => anthropic.messages.create({
+    // ── PASS 1: Force Claude to observe everything before committing ──────────
+    // By making it describe what it sees first, it can't skip straight to guessing.
+    // This observation step dramatically reduces hallucinated numbers and set names.
+    const obs = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 800,
+      max_tokens: 600,
       messages: [{
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-          {
-            type: 'text',
-            text: `You are a trading card expert. Identify this card using BOTH visual recognition AND text reading.
+          { type: 'text', text: `Look at this trading card image carefully. Before identifying it, describe exactly what you observe in each specific area. Be precise — only describe what you can actually see, not what you think it might be.
 
-VISUAL RECOGNITION FIRST — look at the whole image:
-- What game is this? (Pokemon: yellow/coloured border, HP top-right; MTG: coloured mana frame, Wizards copyright; YGO: dark border, ATK/DEF box; Lorcana: ink drop symbol; One Piece: Bandai copyright)
-- What does the artwork show? (character, creature, spell — this tells you the card name)
-- Is the card surface holographic/foil/shiny?
-- What set symbol is in the bottom-left corner?
+1. CARD BORDER & FRAME: What colour/style is the border? What does the overall frame layout look like?
+2. ARTWORK: Describe the illustration in detail — what creature/character/object is depicted, what colours, what setting?
+3. TOP TEXT (card name area): Spell out every character you can read at the top of the card.
+4. BOTTOM-RIGHT TEXT (card number): Read every digit and character in the bottom-right corner exactly as printed.
+5. BOTTOM TEXT (set name / copyright): Read the tiny text along the very bottom of the card.
+6. SET SYMBOL: Describe the shape/icon in the bottom-left corner.
+7. RARITY SYMBOL: Describe the small symbol next to the card number (circle, diamond, star, etc.).
+8. HP or ATK/DEF: What number appears for HP (top-right on Pokemon) or ATK/DEF (bottom of YGO)?
+9. SURFACE: Is the card foil/holographic/shiny, or flat?
+10. CONDITION: What do the card edges and surface look like?
 
-TEXT READING — zoom into specific areas:
-- Card name: top of card, read EXACTLY including accents and punctuation (Farfetch'd, Pikachu ex, Charizard V, etc.)
-- Card number: bottom-right corner — read every digit carefully (e.g. 4/102, 110/113, SV122, SWSH001)
-- Set name: tiny text at very bottom near copyright (e.g. "Base Set", "Noble Victories", "Scarlet & Violet—Paradox Rift", "Darkness Ablaze")
-- Rarity: symbol near card number (circle=Common, diamond=Uncommon, star=Rare, star+H=Holo Rare, star+3=Ultra Rare)
-- HP (Pokemon only), Attack/Defense (YGO only) — helps confirm card identity
+Respond in plain text, one numbered point per line.` }
+        ]
+      }]
+    }));
 
-STRICT RULES:
-- If you can see the card name clearly from artwork OR text, report it — use both to cross-check
-- Set null for number/set only if genuinely unreadable — do NOT default to null if you can make it out
-- NEVER invent a number that doesn't match the set total (e.g. 101/100 is impossible)
-- Condition: look at card edges and surface for scratches, whitening, creases
+    const observations = obs.content.map(b => b.text || '').join('').trim();
+    if (!observations) throw new Error('Observation pass returned empty');
+
+    // ── PASS 2: Commit to final identification using the observations ─────────
+    // Now Claude must cross-check its own observations against what's possible.
+    const response = await withRetry(() => anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 500,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
+            { type: 'text', text: `Look at this trading card image carefully. Before identifying it, describe exactly what you observe in each specific area. Be precise — only describe what you can actually see, not what you think it might be.
+
+1. CARD BORDER & FRAME: What colour/style is the border? What does the overall frame layout look like?
+2. ARTWORK: Describe the illustration in detail — what creature/character/object is depicted, what colours, what setting?
+3. TOP TEXT (card name area): Spell out every character you can read at the top of the card.
+4. BOTTOM-RIGHT TEXT (card number): Read every digit and character in the bottom-right corner exactly as printed.
+5. BOTTOM TEXT (set name / copyright): Read the tiny text along the very bottom of the card.
+6. SET SYMBOL: Describe the shape/icon in the bottom-left corner.
+7. RARITY SYMBOL: Describe the small symbol next to the card number (circle, diamond, star, etc.).
+8. HP or ATK/DEF: What number appears for HP (top-right on Pokemon) or ATK/DEF (bottom of YGO)?
+9. SURFACE: Is the card foil/holographic/shiny, or flat?
+10. CONDITION: What do the card edges and surface look like?
+
+Respond in plain text, one numbered point per line.` }
+          ]
+        },
+        { role: 'assistant', content: observations },
+        {
+          role: 'user',
+          content: `Based on your observations above, now identify the card precisely.
+
+CROSS-CHECK RULES before committing:
+- The card name from TEXT (point 3) must match what the ARTWORK (point 2) shows — if they conflict, trust the text
+- The card number (point 4) must be physically possible for the set (e.g. 4/102 means set has 102 cards — a number higher than the total is a misread)
+- Use the artwork description to confirm the card name if the text was unclear
+- The set name (point 5) and set symbol (point 6) must be consistent with each other
+- If a field was unclear in your observations, set it to null — never guess
 
 Respond ONLY with valid JSON, no markdown:
 {
-  "name": "exact card name",
+  "name": "exact card name matching your text observation",
   "game": "Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other",
-  "set": "exact set name or null",
-  "number": "exact number e.g. 4/102 or null",
-  "rarity": "rarity or null",
+  "set": "exact set name from bottom text, or null",
+  "number": "exact number from bottom-right, or null",
+  "rarity": "rarity from symbol description, or null",
   "year": "copyright year or null",
   "condition": "Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played",
   "foil": true or false,
@@ -409,10 +403,9 @@ Respond ONLY with valid JSON, no markdown:
   "ebayQuery": "name set number rarity for eBay sold listings",
   "cardmarketQuery": "name set"
 }
-If not a card or completely unreadable: {"error":"Cannot identify card"}`
-          }
-        ]
-      }]
+If not a card or too blurry to identify at all: {"error":"Cannot identify card"}`
+        }
+      ]
     }));
 
     const raw = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
@@ -420,7 +413,8 @@ If not a card or completely unreadable: {"error":"Cannot identify card"}`
     try { card = JSON.parse(raw); }
     catch { card = parseJSON(raw) || { error: 'Could not parse response.' }; }
 
-    if (!card.error) await cacheSet(cKey, card, 86400);
+    // Cache the result — but only 6hrs (not 24hrs) so corrections propagate faster
+    if (!card.error) await cacheSet(cKey, card, 21600);
     return res.json(card);
   } catch (err) {
     console.error('identify error:', err.message);
@@ -446,10 +440,10 @@ app.post('/prices', async (req, res) => {
   const lookup = await lookupCard(card);
 
   const tcgplayer = (lookup?.tcgmarket != null)
-    ? { available: true,  market: lookup.tcgmarket, low: lookup.tcglow, high: lookup.tcghigh, currency: lookup.currency || 'USD', source: lookup.source, isEstimate: false }
+    ? { available: true, market: lookup.tcgmarket, low: lookup.tcglow, high: lookup.tcghigh, currency: lookup.currency || 'USD', source: lookup.source, isEstimate: false }
     : { available: false, market: null, currency: 'USD', isEstimate: false };
 
-  // eBay: real sold-listings search link — shown as clickable button in frontend
+  // eBay: direct sold-listings search link
   const ebay = {
     available: false,
     avg: null,
@@ -460,15 +454,23 @@ app.post('/prices', async (req, res) => {
     isEstimate: false
   };
 
+  // PriceCharting: search link (their API requires a paid token)
+  const pricecharting = {
+    available: false,
+    market: null,
+    currency: 'USD',
+    searchUrl: buildPriceChartingUrl(card),
+    isEstimate: false
+  };
+
   const officialImageUrl = lookup?.imageUrl || null;
 
   // ── Number verification: compare scanned number vs number on the official image
   let numberVerification = null;
   if (officialImageUrl && card.number) {
     numberVerification = await verifyCardNumber(card, officialImageUrl);
-    // If the numbers don't match, trust the official image — it's the ground truth
     if (numberVerification && !numberVerification.matches && numberVerification.officialNumber) {
-      console.log(`[verify] Correcting number: "${card.number}" → "${numberVerification.officialNumber}"`);
+      console.log(`[verify] Correcting number: "${card.number}" -> "${numberVerification.officialNumber}"`);
     }
   }
 
@@ -479,15 +481,14 @@ app.post('/prices', async (req, res) => {
   const result = {
     tcgplayer,
     ebay,
-    cardkingdom: { available: false, retail: null, currency: 'USD', isEstimate: false },
+    pricecharting,
     officialImageUrl,
-    // Number verification result — frontend uses this to show correction notice
     numberVerification: numberVerification ? {
       scannedNumber:  card.number,
       officialNumber: numberVerification.officialNumber,
       matches:        numberVerification.matches,
       corrected:      numberVerification.corrected,
-      verifiedNumber  // the one to actually use
+      verifiedNumber
     } : null
   };
 
