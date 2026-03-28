@@ -133,71 +133,129 @@ app.post('/prices', async (req, res) => {
   const cached = cacheGet(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
-  try {
-    // Use Claude with web search to fetch prices from all 3 sources simultaneously
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 2000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: [{
-        role: 'user',
-        content: `Search for current prices for this trading card from three specific sources. Search all three and return results.
+  const thirdSource = card.game === 'Magic: The Gathering' ? 'MTGGoldfish' : 'Cardmarket';
+  const thirdQuery  = card.game === 'Magic: The Gathering'
+    ? `${card.name} mtggoldfish price`
+    : `${card.cardmarketQuery || card.name} cardmarket price`;
+
+  const systemPrompt = `You are a trading card price research assistant. 
+Search for real current prices using web search, then respond ONLY with a JSON object — no explanation, no markdown fences.
+Always attempt all three searches before responding.`;
+
+  const userPrompt = `Find current market prices for this trading card from three sources.
 
 Card: ${card.name}
 Game: ${card.game}
-Set: ${card.set || ''}
+Set: ${card.set || 'unknown'}
 Number: ${card.number || ''}
 Rarity: ${card.rarity || ''}
 Special: ${card.extra || ''}
 
-Search queries to use:
-1. TCGPlayer: site:tcgplayer.com "${card.tcgplayerQuery || card.name}"
-2. eBay Australia sold: site:ebay.com.au "${card.ebayQuery || card.name}" sold
-3. ${card.game === 'Magic: The Gathering' ? 'MTGGoldfish: site:mtggoldfish.com "' + (card.name) + '"' : 'Cardmarket: site:cardmarket.com "' + (card.cardmarketQuery || card.name) + '"'}
+Do three separate web searches:
+1. "${card.tcgplayerQuery || card.name} tcgplayer price"
+2. "${card.ebayQuery || card.name} ebay australia sold"  
+3. "${thirdQuery}"
 
-Respond ONLY with this JSON (no markdown):
+After searching, respond with ONLY this JSON structure (no markdown, no explanation):
 {
   "tcgplayer": {
-    "available": true or false,
-    "low": number or null,
-    "mid": number or null,
-    "high": number or null,
-    "market": number or null,
+    "available": true,
+    "low": 5.00,
+    "mid": 8.00,
+    "high": 12.00,
+    "market": 7.50,
     "currency": "USD",
-    "url": "direct URL or null",
-    "lastUpdated": "today's date or null"
+    "url": "https://www.tcgplayer.com/..."
   },
   "ebay": {
-    "available": true or false,
+    "available": true,
     "recentSales": [
-      {"title": "", "price": 0, "currency": "AUD", "date": "", "condition": ""}
+      {"title": "card name listing", "price": 10.00, "currency": "AUD", "date": "2025-03", "condition": "Near Mint"}
     ],
-    "low": number or null,
-    "avg": number or null,
-    "high": number or null,
+    "low": 8.00,
+    "avg": 11.00,
+    "high": 15.00,
     "currency": "AUD",
-    "url": "search URL or null"
+    "url": "https://www.ebay.com.au/..."
   },
   "cardmarket": {
-    "available": true or false,
-    "low": number or null,
-    "trend": number or null,
-    "avg30": number or null,
+    "available": true,
+    "low": 4.00,
+    "trend": 6.50,
+    "avg30": 6.00,
     "currency": "EUR",
-    "url": "direct URL or null",
-    "sourceName": "${card.game === 'Magic: The Gathering' ? 'MTGGoldfish' : 'Cardmarket'}"
+    "url": "https://www.cardmarket.com/...",
+    "sourceName": "${thirdSource}"
   }
-}`
-      }]
-    });
+}
+If a source has no data, set "available": false and all prices to null.`;
 
-    const raw = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
+  try {
+    const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+
+    // Agentic loop — Claude may call web_search multiple times before final answer
+    let messages = [{ role: 'user', content: userPrompt }];
+    let finalText = '';
+    let iterations = 0;
+    const MAX_ITER = 8;
+
+    while (iterations < MAX_ITER) {
+      iterations++;
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        system: systemPrompt,
+        tools,
+        messages
+      });
+
+      // Collect any text from this turn
+      const textBlocks = response.content.filter(b => b.type === 'text');
+      if (textBlocks.length) finalText = textBlocks.map(b => b.text).join('');
+
+      // If model is done, break
+      if (response.stop_reason === 'end_turn') break;
+
+      // If model wants to use tools, feed results back and continue
+      if (response.stop_reason === 'tool_use') {
+        const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+        if (!toolUseBlocks.length) break;
+
+        // Add assistant message with tool calls
+        messages.push({ role: 'assistant', content: response.content });
+
+        // Add tool results (web search results come back automatically via the SDK)
+        const toolResults = toolUseBlocks.map(b => ({
+          type: 'tool_result',
+          tool_use_id: b.id,
+          content: 'Search completed. Use the results from the search to populate the price data.'
+        }));
+        messages.push({ role: 'user', content: toolResults });
+        continue;
+      }
+
+      break;
+    }
+
+    // Parse the final JSON response
     let prices;
     try {
-      prices = JSON.parse(raw);
-    } catch {
-      const match = raw.match(/\{[\s\S]*\}/);
-      prices = match ? JSON.parse(match[0]) : { tcgplayer: { available: false }, ebay: { available: false }, cardmarket: { available: false } };
+      const cleaned = finalText.replace(/```json|```/g, '').trim();
+      // Extract JSON object if there's surrounding text
+      const match = cleaned.match(/\{[\s\S]*\}/);
+      prices = match ? JSON.parse(match[0]) : null;
+    } catch (e) {
+      console.error('JSON parse error:', e.message, '\nRaw:', finalText.slice(0, 500));
+      prices = null;
+    }
+
+    // Fallback if parsing failed
+    if (!prices) {
+      prices = {
+        tcgplayer:   { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' },
+        ebay:        { available: false, recentSales: [], low: null, avg: null, high: null, currency: 'AUD' },
+        cardmarket:  { available: false, low: null, trend: null, avg30: null, currency: 'EUR', sourceName: thirdSource }
+      };
     }
 
     cacheSet(cacheKey, prices);
