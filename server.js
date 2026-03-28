@@ -151,18 +151,18 @@ app.post('/prices', async (req, res) => {
     try {
       const text = await agenticSearch(
         'You are a trading card price researcher. Search and respond ONLY with JSON, no markdown.',
-        `Search TCGPlayer for the current price of this card:
+        `Search TCGPlayer for the current market price of this card:
 Card: ${card.name}, Set: ${card.set || ''}, Number: ${card.number || ''}, Rarity: ${card.rarity || ''}
 Search: "${card.tcgplayerQuery || card.name} tcgplayer"
 
 Respond ONLY with this JSON:
-{"available":true,"low":5.00,"mid":8.00,"high":12.00,"market":7.50,"currency":"USD","url":"https://www.tcgplayer.com/..."}
-If not found: {"available":false,"low":null,"mid":null,"high":null,"market":null,"currency":"USD"}`, 5
+{"available":true,"market":7.50,"currency":"USD","url":"https://www.tcgplayer.com/..."}
+If not found: {"available":false,"market":null,"currency":"USD"}`, 5
       );
-      const result = parseJSON(text) || { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' };
+      const result = parseJSON(text) || { available: false, market: null, currency: 'USD' };
       cacheSet(cKey, result);
       return result;
-    } catch { return { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' }; }
+    } catch { return { available: false, market: null, currency: 'USD' }; }
   }
 
   async function searchEbay() {
@@ -172,21 +172,21 @@ If not found: {"available":false,"low":null,"mid":null,"high":null,"market":null
     try {
       const text = await agenticSearch(
         'You are a trading card price researcher. Search eBay sold listings and respond ONLY with JSON, no markdown.',
-        `Search ${ebayConf.label} sold listings for this card:
+        `Search ${ebayConf.label} sold listings for this card and find the average sold price:
 Card: ${card.name}, Set: ${card.set || ''}, Number: ${card.number || ''}
 Search: "${card.ebayQuery || card.name} ${ebayConf.domain} sold"
 
 Respond ONLY with this JSON:
-{"available":true,"recentSales":[{"title":"","price":0,"currency":"${ebayConf.currency}","date":"","condition":""}],"low":8.00,"avg":11.00,"high":15.00,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}","url":"https://www.${ebayConf.domain}/..."}
-If not found: {"available":false,"recentSales":[],"low":null,"avg":null,"high":null,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}"}`, 5
+{"available":true,"avg":11.00,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}","url":"https://www.${ebayConf.domain}/..."}
+If not found: {"available":false,"avg":null,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}"}`, 5
       );
-      const result = parseJSON(text) || { available: false, recentSales: [], low: null, avg: null, high: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label };
+      const result = parseJSON(text) || { available: false, avg: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label };
       result.region      = ebayRegion;
       result.regionLabel = ebayConf.label;
       result.currency    = result.currency || ebayConf.currency;
       cacheSet(cKey, result);
       return result;
-    } catch { return { available: false, recentSales: [], low: null, avg: null, high: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label }; }
+    } catch { return { available: false, avg: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label }; }
   }
 
   async function searchCardKingdom() {
@@ -196,18 +196,18 @@ If not found: {"available":false,"recentSales":[],"low":null,"avg":null,"high":n
     try {
       const text = await agenticSearch(
         'You are a trading card price researcher. Search Card Kingdom and respond ONLY with JSON, no markdown.',
-        `Search Card Kingdom for the current retail and buylist price of this card:
+        `Search Card Kingdom for the current retail price of this card:
 Card: ${card.name}, Set: ${card.set || ''}
 Search: "${card.name} ${card.set || ''} card kingdom"
 
 Respond ONLY with this JSON:
-{"available":true,"buylist":3.00,"retail":8.00,"currency":"USD","url":"https://www.cardkingdom.com/..."}
-If not found: {"available":false,"buylist":null,"retail":null,"currency":"USD"}`, 5
+{"available":true,"retail":8.00,"currency":"USD","url":"https://www.cardkingdom.com/..."}
+If not found: {"available":false,"retail":null,"currency":"USD"}`, 5
       );
-      const result = parseJSON(text) || { available: false, buylist: null, retail: null, currency: 'USD' };
+      const result = parseJSON(text) || { available: false, retail: null, currency: 'USD' };
       cacheSet(cKey, result);
       return result;
-    } catch { return { available: false, buylist: null, retail: null, currency: 'USD' }; }
+    } catch { return { available: false, retail: null, currency: 'USD' }; }
   }
 
   try {
@@ -362,27 +362,16 @@ Keep the array to a maximum of 15 most notable/valuable versions.`,
           const priceText = await agenticSearch(
             `You are a trading card price researcher. Search eBay Australia sold listings and respond ONLY with JSON — no markdown.`,
             `Search eBay Australia sold listings for: "${v.ebayQuery || `${card.name} ${v.set}`}"
-
-Find recent sold prices on ebay.com.au for this exact card version.
-
-Respond with ONLY this JSON (no markdown):
-{
-  "low": 5.00,
-  "avg": 10.00,
-  "high": 18.00,
-  "salesCount": 3,
-  "currency": "AUD",
-  "available": true
-}
-If no sales found set available: false and all prices to null.`,
+Find the average sold price. Respond with ONLY this JSON:
+{"available":true,"avg":10.00,"currency":"AUD"}
+If no sales found: {"available":false,"avg":null,"currency":"AUD"}`,
             5
           );
-
-          const priceData = parseJSON(priceText) || { available: false, low: null, avg: null, high: null, currency: 'AUD' };
+          const priceData = parseJSON(priceText) || { available: false, avg: null, currency: 'AUD' };
           cacheSet(vCacheKey, priceData);
           return { ...v, ...priceData };
         } catch {
-          return { ...v, available: false, low: null, avg: null, high: null, currency: 'AUD' };
+          return { ...v, available: false, avg: null, currency: 'AUD' };
         }
       });
 
