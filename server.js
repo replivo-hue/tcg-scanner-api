@@ -233,9 +233,9 @@ If not found: {"available":false,"retail":null,"currency":"USD"}`, 5
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// HELPER: agentic web search loop
+// HELPER: web search — server-side tool, Anthropic handles results automatically
 // ═════════════════════════════════════════════════════════════════════════════
-async function agenticSearch(systemPrompt, userPrompt, maxIter = 6) {
+async function agenticSearch(systemPrompt, userPrompt, maxIter = 5) {
   const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
   let messages = [{ role: 'user', content: userPrompt }];
   let finalText = '';
@@ -243,55 +243,38 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 6) {
   for (let i = 0; i < maxIter; i++) {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 2000,
+      max_tokens: 1024,
       system: systemPrompt,
       tools,
       messages
     });
 
-    console.log(`[agenticSearch] iter=${i} stop_reason=${response.stop_reason} content_types=${response.content.map(b=>b.type).join(',')}`);
+    console.log(`[search] iter=${i} stop=${response.stop_reason} blocks=${response.content.map(b=>b.type).join(',')}`);
 
-    // Collect text from this turn
-    const textBlocks = response.content.filter(b => b.type === 'text');
-    if (textBlocks.length) {
-      finalText = textBlocks.map(b => b.text).join('');
-      console.log(`[agenticSearch] text preview: ${finalText.slice(0,200)}`);
+    // Collect any text blocks
+    for (const block of response.content) {
+      if (block.type === 'text') finalText += block.text;
     }
 
-    if (response.stop_reason === 'end_turn') break;
+    // If done, return
+    if (response.stop_reason === 'end_turn') {
+      console.log(`[search] done. text=${finalText.slice(0,300)}`);
+      break;
+    }
 
+    // For server-side tools (web_search), append the full response as assistant
+    // turn and continue — Anthropic has already handled the search internally
     if (response.stop_reason === 'tool_use') {
-      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
-      if (!toolUseBlocks.length) break;
-
-      console.log(`[agenticSearch] tool_use blocks: ${toolUseBlocks.map(b=>b.name).join(',')}`);
-
-      // Add the full assistant message to history
       messages.push({ role: 'assistant', content: response.content });
-
-      // Check for inline tool_result blocks first
-      const toolResultBlocks = response.content.filter(b => b.type === 'tool_result');
-      console.log(`[agenticSearch] inline tool_result blocks: ${toolResultBlocks.length}`);
-
-      if (toolResultBlocks.length) {
-        messages.push({ role: 'user', content: toolResultBlocks });
-      } else {
-        // Acknowledge each tool use to continue the loop
-        messages.push({
-          role: 'user',
-          content: toolUseBlocks.map(b => ({
-            type: 'tool_result',
-            tool_use_id: b.id,
-            content: 'No results returned.'
-          }))
-        });
-      }
+      // No need to add tool_result — server-side tools are self-contained
+      // Just ask Claude to continue with what it found
+      messages.push({ role: 'user', content: 'Please now provide your JSON answer based on the search results.' });
       continue;
     }
+
     break;
   }
 
-  console.log(`[agenticSearch] finalText length: ${finalText.length}`);
   return finalText;
 }
 
