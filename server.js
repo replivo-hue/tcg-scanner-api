@@ -246,27 +246,6 @@ async function getRealPrices(card, ebayRegion = 'AU') {
   return { tcgplayer, ebay, cardkingdom: { available: false, retail: null, currency: 'USD', isEstimate: false } };
 }
 
-}
-If you genuinely have no data for a source set available:false for that source only.`
-      }]
-    }));
-    const raw = r.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
-    const data = parseJSON(raw);
-    if (data) {
-      // Ensure region info is always stamped
-      if (data.ebay) { data.ebay.region = ebayRegion; data.ebay.regionLabel = conf.label; data.ebay.currency = conf.currency; }
-      return data;
-    }
-  } catch (e) { console.log('[price claude]', e.message); }
-
-  // Hard fallback — should never reach here
-  return {
-    tcgplayer:   { available: false, market: null, currency: 'USD' },
-    ebay:        { available: false, avg: null, currency: conf.currency, region: ebayRegion, regionLabel: conf.label },
-    cardkingdom: { available: false, retail: null, currency: 'USD' }
-  };
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // CARD IMAGE — free TCG APIs
 // ═════════════════════════════════════════════════════════════════════════════
@@ -462,9 +441,6 @@ app.post('/card-image', async (req, res) => {
   return res.json(result);
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
-// POST /variants — real printings from TCG APIs, real prices, no fabrication
-// ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /variants — real printings from TCG APIs, real prices, no fabrication
 // Pokemon: PokéTCG API returns real card list with real TCGPlayer prices
