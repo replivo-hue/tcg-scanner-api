@@ -44,7 +44,25 @@ function checkRate(ip) {
   return true;
 }
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
+// ─── Retry with exponential backoff for 429s ─────────────────────────────────
+async function withRetry(fn, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const is429 = err?.status === 429 || err?.message?.includes('429') || err?.message?.includes('rate limit');
+      if (is429 && attempt < maxRetries) {
+        const wait = (attempt + 1) * 3000; // 3s, 6s, 9s
+        console.log(`[retry] 429 hit, waiting ${wait}ms before retry ${attempt + 1}`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+
 app.use(cors());
 app.use(express.json({ limit: '12mb' }));
 
@@ -71,7 +89,7 @@ app.post('/identify', async (req, res) => {
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
-    const response = await anthropic.messages.create({
+    const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 600,
       messages: [{
@@ -116,7 +134,7 @@ If you cannot identify it:
           }
         ]
       }]
-    });
+    }));
 
     const raw  = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
     const card = JSON.parse(raw);
@@ -223,11 +241,12 @@ If not found: {"available":false,"retail":null,"currency":"USD"}`, 5
   }
 
   try {
-    // Run all 3 in parallel — total time = slowest single search, not sum of all 3
+    // Stagger starts by 500ms each to avoid hitting rate limits simultaneously
+    const delay = ms => new Promise(r => setTimeout(r, ms));
     const [tcgplayer, ebay, cardkingdom] = await Promise.all([
       searchTCGPlayer(),
-      searchEbay(),
-      searchCardKingdom()
+      delay(500).then(() => searchEbay()),
+      delay(1000).then(() => searchCardKingdom())
     ]);
 
     const prices = { tcgplayer, ebay, cardkingdom };
@@ -250,13 +269,13 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 5) {
   let finalText = '';
 
   for (let i = 0; i < maxIter; i++) {
-    const response = await anthropic.messages.create({
+    const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
       system: systemPrompt,
       tools,
       messages
-    });
+    }));
 
     console.log(`[search] iter=${i} stop=${response.stop_reason} blocks=${response.content.map(b=>b.type).join(',')}`);
 
