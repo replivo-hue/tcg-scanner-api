@@ -1,7 +1,7 @@
 /**
  * TCG Price Scanner — Backend Server v3
  * - Identify: Claude Sonnet vision (accurate, reads exact card text)
- * - Prices: Claude Haiku knowledge (always returns a price estimate)
+ * - Prices: Real TCG APIs (PokéTCG, Scryfall, YGOPRODeck) — never fabricated
  * - Images: Free TCG APIs (PokéTCG, Scryfall, YGOPRODeck, Lorcana)
  * - Cache: Redis (persistent) with in-memory fallback
  */
@@ -117,49 +117,135 @@ const EBAY_REGIONS = {
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
-// PRICE LOOKUP — Claude Haiku knowledge, always returns something
-// Scraping is unreliable from Railway IPs; Claude knows TCG prices well
+// PRICE LOOKUP — Real APIs only. NEVER fabricate prices.
+// Pokemon: PokéTCG API (has real TCGPlayer market prices)
+// MTG: Scryfall (has real USD market prices)
+// YGO: YGOPRODeck (has real TCGPlayer prices)
+// eBay: surface a direct sold-listings search URL — never scrape/invent a number
+// Returns available:false with null values when real data is not found.
 // ═════════════════════════════════════════════════════════════════════════════
-async function getPricesFromClaude(card, ebayRegion = 'AU') {
-  const conf = EBAY_REGIONS[ebayRegion] || EBAY_REGIONS['AU'];
+
+// ── PokéTCG prices (Pokemon only) ────────────────────────────────────────────
+async function fetchPokemonPrices(card) {
   try {
-    const r = await withRetry(() => anthropic.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 400,
-      messages: [{
-        role: 'user',
-        content: `You are a trading card price expert. Give current approximate market prices for this card.
+    const nameQ = card.name.replace(/[^a-zA-Z0-9 '\-]/g, '').trim();
+    const numQ  = card.number ? card.number.split('/')[0].replace(/[^a-zA-Z0-9]/g, '') : '';
+    let apiCard = null;
 
-Card: ${card.name}
-Game: ${card.game}
-Set: ${card.set || 'unknown'}
-Number: ${card.number || ''}
-Rarity: ${card.rarity || ''}
-Foil: ${card.foil ? 'Yes' : 'No'}
-Special: ${card.extra || 'none'}
+    // Strategy 1: name + number (most precise)
+    if (numQ) {
+      const q = encodeURIComponent(`name:"${nameQ}" number:${numQ}`);
+      const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=20`);
+      if (r.status === 200) {
+        const cards = JSON.parse(r.body).data || [];
+        const setWord = (card.set || '').toLowerCase().split(' ')[0];
+        apiCard = cards.find(c => setWord && c.set?.name?.toLowerCase().includes(setWord)) || cards[0] || null;
+      }
+    }
+    // Strategy 2: name only, filter by set word
+    if (!apiCard) {
+      const q2 = encodeURIComponent(`name:"${nameQ}"`);
+      const r2 = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q2}&pageSize=20&orderBy=-set.releaseDate`);
+      if (r2.status === 200) {
+        const cards = JSON.parse(r2.body).data || [];
+        const setWord = (card.set || '').toLowerCase().split(' ')[0];
+        apiCard = cards.find(c => setWord && c.set?.name?.toLowerCase().includes(setWord)) || cards[0] || null;
+      }
+    }
 
-Respond ONLY with this JSON (no markdown). Always provide your best price estimate — never leave all prices null:
-{
-  "tcgplayer": {
-    "available": true,
-    "market": 12.50,
-    "currency": "USD",
-    "isEstimate": true
-  },
-  "ebay": {
-    "available": true,
-    "avg": 15.00,
-    "currency": "${conf.currency}",
-    "region": "${ebayRegion}",
-    "regionLabel": "${conf.label}",
-    "isEstimate": true
-  },
-  "cardkingdom": {
-    "available": true,
-    "retail": 11.00,
-    "currency": "USD",
-    "isEstimate": true
-  }
+    if (!apiCard) return null;
+    const p = apiCard.tcgplayer?.prices;
+    if (!p) return null;
+    const tier = p.holoRare || p.reverseHoloRare || p.rare || p['1stEditionHoloRare'] || p.normal || p.unlimited || null;
+    if (!tier) return null;
+
+    return {
+      market:   tier.market   ?? tier.mid   ?? null,
+      low:      tier.low      ?? null,
+      high:     tier.high     ?? null,
+      currency: 'USD',
+      source:   'TCGPlayer via PokéTCG API',
+      imageUrl: apiCard.images?.large || apiCard.images?.small || null
+    };
+  } catch (e) { console.log('[price pokemon]', e.message); return null; }
+}
+
+// ── Scryfall prices (Magic only) ──────────────────────────────────────────────
+async function fetchScryfallPrices(card) {
+  try {
+    const q = encodeURIComponent(card.name);
+    let r = null;
+    if (card.set) {
+      const setSlug = card.set.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 6);
+      r = await httpGet(`https://api.scryfall.com/cards/named?fuzzy=${q}&set=${encodeURIComponent(setSlug)}`);
+    }
+    if (!r || r.status !== 200) {
+      r = await httpGet(`https://api.scryfall.com/cards/named?fuzzy=${q}`);
+    }
+    if (r.status !== 200) return null;
+    const data = JSON.parse(r.body);
+    const prices = data?.prices;
+    if (!prices) return null;
+    const market = parseFloat(prices.usd) || parseFloat(prices.usd_foil) || null;
+    if (market == null) return null;
+    return {
+      market, low: null, high: null, currency: 'USD', source: 'Scryfall',
+      imageUrl: data?.image_uris?.normal || data?.card_faces?.[0]?.image_uris?.normal || null
+    };
+  } catch (e) { console.log('[price scryfall]', e.message); return null; }
+}
+
+// ── YGOPRODeck prices (Yu-Gi-Oh only) ────────────────────────────────────────
+async function fetchYGOPrices(card) {
+  try {
+    const q = encodeURIComponent(card.name);
+    const r = await httpGet(`https://db.ygoprodeck.com/api/v7/cardinfo.php?name=${q}`);
+    if (r.status !== 200) return null;
+    const cardData = JSON.parse(r.body).data?.[0];
+    if (!cardData) return null;
+    const prices = cardData.card_prices?.[0];
+    const market = parseFloat(prices?.tcgplayer_price) || null;
+    if (market == null) return null;
+    return {
+      market, low: null, high: null, currency: 'USD', source: 'YGOPRODeck/TCGPlayer',
+      imageUrl: cardData.card_images?.[0]?.image_url || null
+    };
+  } catch (e) { console.log('[price ygo]', e.message); return null; }
+}
+
+function buildEbaySearchUrl(card, domain) {
+  const parts = [card.name, card.set, card.number, card.rarity].filter(Boolean);
+  return `https://www.${domain}/sch/i.html?_nkw=${encodeURIComponent(parts.join(' '))}&LH_Sold=1&LH_Complete=1`;
+}
+
+// ── Main price resolver: REAL DATA ONLY, never fabricate ─────────────────────
+async function getRealPrices(card, ebayRegion = 'AU') {
+  const conf = EBAY_REGIONS[ebayRegion] || EBAY_REGIONS['AU'];
+  const game = (card.game || '').toLowerCase();
+
+  let tcgData = null;
+  if (game.includes('pokemon'))                            tcgData = await fetchPokemonPrices(card);
+  else if (game.includes('magic'))                         tcgData = await fetchScryfallPrices(card);
+  else if (game.includes('yu-gi-oh') || game.includes('yugioh')) tcgData = await fetchYGOPrices(card);
+
+  const tcgplayer = tcgData
+    ? { available: true, market: tcgData.market, low: tcgData.low, high: tcgData.high, currency: tcgData.currency, source: tcgData.source, isEstimate: false }
+    : { available: false, market: null, currency: 'USD', isEstimate: false };
+
+  // eBay: never scrape/fabricate — give user a direct sold-listings link instead
+  const ebay = {
+    available: false,
+    avg: null,
+    currency: conf.currency,
+    region: ebayRegion,
+    regionLabel: conf.label,
+    searchUrl: buildEbaySearchUrl(card, conf.domain),
+    isEstimate: false
+  };
+
+  return { tcgplayer, ebay, cardkingdom: { available: false, retail: null, currency: 'USD', isEstimate: false } };
+}
+
 }
 If you genuinely have no data for a source set available:false for that source only.`
       }]
@@ -190,32 +276,20 @@ async function fetchCardImage(card) {
   // ── Pokémon: PokéTCG API ────────────────────────────────────────────────────
   if (game.includes('pokemon')) {
     try {
-      const nameQ = card.name.replace(/[^a-zA-Z0-9 '-]/g, '').trim();
-      const numQ  = card.number ? card.number.split('/')[0].replace(/[^a-zA-Z0-9]/g, '') : '';
-
-      // Strategy 1: name + number (most precise)
-      if (numQ) {
-        const q = encodeURIComponent(`name:"${nameQ}" number:${numQ}`);
-        const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=20`);
-        if (r.status === 200) {
-          const cards = (JSON.parse(r.body).data || []);
-          // Prefer set name match, else first result
-          const setWord = (card.set || '').toLowerCase().split(' ')[0];
-          const match = cards.find(c => setWord && c.set?.name?.toLowerCase().includes(setWord)) || cards[0];
-          const url = match?.images?.large || match?.images?.small;
-          if (url) { console.log('[img pokemon] matched via name+number'); return url; }
-        }
-      }
-
-      // Strategy 2: name only (loose), then filter by set
-      const q2 = encodeURIComponent(`name:"${nameQ}"`);
-      const r2 = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q2}&pageSize=20&orderBy=-set.releaseDate`);
-      if (r2.status === 200) {
-        const cards = (JSON.parse(r2.body).data || []);
-        const setWord = (card.set || '').toLowerCase().split(' ')[0];
-        const match = cards.find(c => setWord && c.set?.name?.toLowerCase().includes(setWord)) || cards[0];
+      // Search by name + card number for precision
+      const nameQ = card.name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
+      const numQ  = card.number ? card.number.split('/')[0] : '';
+      const q     = encodeURIComponent(`name:"${nameQ}"${numQ ? ` number:"${numQ}"` : ''}`);
+      const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=10&orderBy=-set.releaseDate`);
+      if (r.status === 200) {
+        const data = JSON.parse(r.body);
+        const cards = data.data || [];
+        // Prefer set match
+        const match = cards.find(c =>
+          card.set && c.set?.name?.toLowerCase().includes(card.set.toLowerCase().split(' ')[0])
+        ) || cards[0];
         const url = match?.images?.large || match?.images?.small;
-        if (url) { console.log('[img pokemon] matched via name-only'); return url; }
+        if (url) return url;
       }
     } catch (e) { console.log('[img pokemon]', e.message); }
   }
@@ -223,25 +297,13 @@ async function fetchCardImage(card) {
   // ── Magic: The Gathering: Scryfall ──────────────────────────────────────────
   if (game.includes('magic')) {
     try {
-      // /cards/named?fuzzy= expects a plain name, not search syntax
-      const q = encodeURIComponent(card.name);
+      const q = encodeURIComponent(`!"${card.name}"`);
       const r = await httpGet(`https://api.scryfall.com/cards/named?fuzzy=${q}`);
       if (r.status === 200) {
         const data = JSON.parse(r.body);
-        // Prefer set-specific print if we have a set code / set name
-        if (card.set) {
-          // Try exact set lookup: /cards/named?fuzzy=NAME&set=XXX
-          const setSlug = card.set.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 6);
-          const r2 = await httpGet(`https://api.scryfall.com/cards/named?fuzzy=${q}&set=${encodeURIComponent(setSlug)}`);
-          if (r2.status === 200) {
-            const d2 = JSON.parse(r2.body);
-            const url2 = d2?.image_uris?.normal || d2?.card_faces?.[0]?.image_uris?.normal;
-            if (url2) { console.log('[img scryfall] matched with set'); return url2; }
-          }
-        }
         const url = data?.image_uris?.normal || data?.image_uris?.small ||
                     data?.card_faces?.[0]?.image_uris?.normal;
-        if (url) { console.log('[img scryfall] matched by name'); return url; }
+        if (url) return url;
       }
     } catch (e) { console.log('[img scryfall]', e.message); }
   }
@@ -293,61 +355,59 @@ app.post('/identify', async (req, res) => {
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
   const len = imageBase64.length;
-  const cKey = 'id3:' + imageBase64.slice(0,16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
+  const cKey = 'id4:' + imageBase64.slice(0,16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
   const cached = await cacheGet(cKey);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
     const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 700,
+      max_tokens: 800,
       messages: [{
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
           {
             type: 'text',
-            text: `You are an expert trading card identifier. Read the text PRINTED ON THIS CARD precisely.
+            text: `You are a trading card identification system. You have TWO jobs: (1) visually recognise the card from its artwork and layout, and (2) read the printed text to confirm exact details.
 
-STEP 1 — IDENTIFY THE GAME first (look at card layout, back design, copyright text):
-- Pokémon: yellow border, HP top-right, "Pokémon TCG" or "©Nintendo" at bottom
-- Magic: The Gathering: black/coloured border, mana symbols, "™ & © Wizards of the Coast"
-- Yu-Gi-Oh!: dark border, ATK/DEF stats, "KONAMI" at bottom
-- Lorcana: ink-drop symbol, Disney copyright
-- One Piece: "ONE PIECE CARD GAME" text, Bandai copyright
+STEP 1 — VISUAL RECOGNITION (use the image):
+- Identify the game from card frame/border/layout (Pokemon yellow border; MTG coloured mana frame; YGO dark border with ATK/DEF)
+- Recognise the card artwork to get the card name
+- Identify the set symbol icon (bottom-left area of most cards)
+- Check if the surface is holographic/foil
 
-STEP 2 — READ THESE FIELDS in order of reliability (most → least):
-1. CARD NUMBER (bottom-right corner, e.g. "120/124", "SV122", "TG20/TG30") — THIS IS THE MOST IMPORTANT FIELD. Read every digit precisely.
-2. CARD NAME (top of card, exactly as printed including punctuation like Farfetch'd, Mr. Mime, etc.)
-3. SET SYMBOL (bottom-left icon — identify the set name it corresponds to)
-4. SET NAME (near copyright at very bottom — for Pokémon this is tiny text e.g. "Scarlet & Violet—Paradox Rift")
-5. RARITY (symbol: circle=common, diamond=uncommon, star=rare, star+H=holo rare, etc.)
-6. FOIL (does the card surface have a holographic/rainbow/shiny finish?)
-7. SPECIAL PRINTING (1st Edition stamp, Full Art, Alt Art, Shadowless, etc.)
+STEP 2 — READ THE TEXT (zoom in mentally on each area):
+- TOP of card: card name (read exactly, including punctuation like Farfetch'd, Pikachu ex, etc.)
+- BOTTOM-RIGHT: card number (e.g. "110/113", "SV122", "SWSH Black Star Promo 001") — READ EVERY CHARACTER
+- BOTTOM of card near copyright: set name (Pokemon: tiny text like "Noble Victories" or "Scarlet & Violet—Paradox Rift")
+- BOTTOM-LEFT: set symbol (visual icon)
+- Rarity symbol: circle=common, diamond=uncommon, star=rare, star+H=holo rare
 
-CRITICAL RULES:
-- If a field is UNCLEAR or partially visible, set it to null — NEVER invent or guess set names/numbers
-- The card number uniquely identifies the exact printing — if you can read it, the set is deterministic
-- For Pokémon: the set abbreviation appears before the slash in newer cards (e.g. "SVI 001/198" = Scarlet & Violet base)
-- For condition: judge from photo quality/card edges (scratches, whitening, creases)
+ABSOLUTE RULES — violation means app shows wrong data to users:
+- The card number + set name together UNIQUELY identify the card. A card "110/113 Noble Victories" MUST exist in the Noble Victories set which has exactly 113 cards. If your number exceeds the set's total, you have misread it — set number to null.
+- NEVER invent or guess a set name. If you cannot clearly read it, return null for set.
+- NEVER invent or guess a card number. If you cannot clearly read it, return null for number.  
+- If confidence is low for any field, set it to null rather than guessing.
+- If the image is too blurry, too dark, or not a trading card: return {"error":"Cannot identify card"}
 
 Respond ONLY with valid JSON, no markdown:
 {
-  "name": "exact name from card",
+  "name": "exact card name as printed",
   "game": "Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other",
-  "set": "exact set name, or null if unreadable",
-  "number": "exact number e.g. 120/124 or SV122, or null if unreadable",
+  "set": "exact set name as printed or null if unreadable",
+  "number": "exact number as printed e.g. 110/113 or null if unreadable",
   "rarity": "rarity text/symbol or null",
   "year": "copyright year or null",
   "condition": "Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played",
   "foil": true or false,
-  "extra": "1st Edition / Shadowless / Full Art / Alt Art / Secret Rare / etc or null",
+  "extra": "1st Edition / Shadowless / Full Art / Alt Art / Secret Rare / Promo / etc or null",
   "confidence": "high | medium | low",
-  "tcgplayerQuery": "name + set + number",
-  "ebayQuery": "name + set + number optimised for eBay sold listings",
-  "cardmarketQuery": "name + set"
+  "tcgplayerQuery": "name set number",
+  "ebayQuery": "name set number rarity optimised for eBay sold listings",
+  "cardmarketQuery": "name set"
 }
-If card is not visible or too blurry to identify: {"error":"Cannot identify card"}`
+If image is unreadable or not a card: {"error":"Cannot identify card"}`
           }
         ]
       }]
@@ -367,7 +427,7 @@ If card is not visible or too blurry to identify: {"error":"Cannot identify card
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// POST /prices — always returns a price (Claude knowledge fallback)
+// POST /prices — real API data only, never fabricated
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/prices', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
@@ -376,12 +436,12 @@ app.post('/prices', async (req, res) => {
   const { card, ebayRegion = 'AU' } = req.body;
   if (!card?.name) return res.status(400).json({ error: 'No card data.' });
 
-  const cKey = `prices4:${card.name}:${card.set}:${card.number}:${card.extra}:${ebayRegion}`;
+  const cKey = `prices5:${card.name}:${card.set}:${card.number}:${card.extra}:${ebayRegion}`;
   const cached = await cacheGet(cKey);
   if (cached) return res.json({ ...cached, cached: true });
 
-  const prices = await getPricesFromClaude(card, ebayRegion);
-  await cacheSet(cKey, prices);
+  const prices = await getRealPrices(card, ebayRegion);
+  await cacheSet(cKey, prices, 3600); // 1hr cache — prices change
   return res.json(prices);
 });
 
@@ -403,7 +463,12 @@ app.post('/card-image', async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// POST /variants — Haiku knowledge for listing, eBay scraping for prices
+// POST /variants — real printings from TCG APIs, real prices, no fabrication
+// ═════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /variants — real printings from TCG APIs, real prices, no fabrication
+// Pokemon: PokéTCG API returns real card list with real TCGPlayer prices
+// MTG/YGO/other: returns empty (fabricating variants is worse than nothing)
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/variants', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
@@ -412,72 +477,83 @@ app.post('/variants', async (req, res) => {
   const { card } = req.body;
   if (!card?.name) return res.status(400).json({ error: 'No card data.' });
 
-  const cKey = `variants4:${card.name}:${card.game}`;
+  const game = (card.game || '').toLowerCase();
+  const cKey = `variants5:${card.name}:${card.game}`;
   const cached = await cacheGet(cKey);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
-    // Step 1: Get all versions from Claude knowledge
-    const r = await withRetry(() => anthropic.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 1500,
-      messages: [{
-        role: 'user',
-        content: `List every known printing of "${card.name}" (${card.game}) across all sets.
-Include: different sets, promos, alt arts, 1st edition, regional variants, secret rares.
-Order by most valuable first. Max 12 versions.
-Respond ONLY with JSON array, no markdown:
-[{"set":"Base Set","year":"1999","number":"4/102","rarity":"Rare Holo","variant":"Shadowless","ebayQuery":"${card.name} Base Set Shadowless Holo 4/102"}]`
-      }]
-    }));
+    let variants = [];
 
-    const raw = r.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
-    const versions = parseJSON(raw);
-    if (!Array.isArray(versions) || !versions.length) return res.json({ variants: [] });
+    if (game.includes('pokemon')) {
+      // PokéTCG API: get ALL real printings of this card
+      const nameQ = card.name.replace(/[^a-zA-Z0-9 '\-]/g, '').trim();
+      const q = encodeURIComponent(`name:"${nameQ}"`);
+      const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=50&orderBy=-set.releaseDate`);
+      if (r.status === 200) {
+        const cards = JSON.parse(r.body).data || [];
+        variants = cards.map(c => {
+          const p = c.tcgplayer?.prices;
+          const tier = p && (p.holoRare || p.reverseHoloRare || p.rare || p['1stEditionHoloRare'] || p.normal || p.unlimited);
+          return {
+            set:      c.set?.name    || null,
+            year:     c.set?.releaseDate?.slice(0,4) || null,
+            number:   c.number      || null,
+            rarity:   c.rarity      || null,
+            variant:  null,
+            imageUrl: c.images?.small || null,
+            available: !!(tier?.market),
+            avg:      tier?.market   ?? null,
+            low:      tier?.low      ?? null,
+            high:     tier?.high     ?? null,
+            currency: 'USD',
+            source:   'TCGPlayer via PokéTCG',
+            ebayQuery: `${card.name} ${c.set?.name || ''} ${c.number || ''}`.trim()
+          };
+        }).filter(v => v.set); // skip any blank entries
+      }
+    } else if (game.includes('magic')) {
+      // Scryfall: get all printings of this card
+      const q = encodeURIComponent(card.name);
+      const r = await httpGet(`https://api.scryfall.com/cards/search?q=!"${q}"&unique=prints&order=released&dir=desc`);
+      if (r.status === 200) {
+        const data = JSON.parse(r.body);
+        variants = (data.data || []).slice(0, 30).map(c => {
+          const market = parseFloat(c.prices?.usd) || parseFloat(c.prices?.usd_foil) || null;
+          return {
+            set:      c.set_name    || null,
+            year:     c.released_at?.slice(0,4) || null,
+            number:   c.collector_number || null,
+            rarity:   c.rarity      || null,
+            variant:  c.frame_effects?.join(', ') || null,
+            imageUrl: c.image_uris?.small || c.card_faces?.[0]?.image_uris?.small || null,
+            available: market != null,
+            avg:      market,
+            currency: 'USD',
+            source:   'Scryfall',
+            ebayQuery: `${card.name} ${c.set_name || ''}`.trim()
+          };
+        }).filter(v => v.set);
+      }
+    }
+    // For all other games: return empty — fabricating variants is dangerous
 
-    // Step 2: Get prices for each variant from Claude (always returns something)
-    const results = await Promise.all(
-      versions.slice(0, 12).map(async (v, i) => {
-        await delay(i * 150);
-        const vKey = `vprice4:${card.name}:${v.set}:${v.variant || ''}`;
-        const vCached = await cacheGet(vKey);
-        if (vCached) return { ...v, ...vCached };
-
-        try {
-          const pr = await withRetry(() => anthropic.messages.create({
-            model: 'claude-haiku-4-5',
-            max_tokens: 150,
-            messages: [{
-              role: 'user',
-              content: `Average eBay Australia sold price for: ${card.name}, ${v.set}, ${v.number || ''}, ${v.rarity || ''}, ${v.variant || ''}
-Respond ONLY with JSON: {"available":true,"avg":10.00,"currency":"AUD"}
-If no data: {"available":false,"avg":null,"currency":"AUD"}`
-            }]
-          }));
-          const pRaw = pr.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
-          const priceData = parseJSON(pRaw) || { available: false, avg: null, currency: 'AUD' };
-          await cacheSet(vKey, priceData);
-          return { ...v, ...priceData };
-        } catch {
-          return { ...v, available: false, avg: null, currency: 'AUD' };
-        }
-      })
-    );
-
-    results.sort((a, b) => {
+    // Sort by price descending, unknowns last
+    variants.sort((a, b) => {
       if (!a.available && b.available) return 1;
       if (a.available && !b.available) return -1;
       return (b.avg || 0) - (a.avg || 0);
     });
 
-    const payload = { variants: results };
-    await cacheSet(cKey, payload);
+    const payload = { variants };
+    if (variants.length) await cacheSet(cKey, payload, 3600);
     return res.json(payload);
   } catch (err) {
     console.error('variants error:', err.message);
     return res.status(500).json({ error: err.message || 'Variant lookup failed.' });
   }
 });
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /generate-listing
