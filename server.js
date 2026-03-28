@@ -18,13 +18,14 @@ const port = process.env.PORT || 3000;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── Simple in-memory cache (resets on redeploy — good enough) ───────────────
-const cache     = new Map();
-const CACHE_TTL = 1000 * 60 * 60 * 6; // 6 hours
+const cache      = new Map();
+const CACHE_TTL  = 1000 * 60 * 60 * 6;  // 6 hours — for prices
+const ID_TTL     = 1000 * 60 * 60 * 1;  // 1 hour  — for identifications
 
-function cacheGet(key) {
+function cacheGet(key, ttl = CACHE_TTL) {
   const hit = cache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.ts > CACHE_TTL) { cache.delete(key); return null; }
+  if (Date.now() - hit.ts > ttl) { cache.delete(key); return null; }
   return hit.data;
 }
 function cacheSet(key, data) { cache.set(key, { ts: Date.now(), data }); }
@@ -62,14 +63,14 @@ app.post('/identify', async (req, res) => {
   const { imageBase64, mediaType = 'image/jpeg' } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
-  // Use first 32 chars of image as rough cache key
-  const cacheKey = 'id:' + imageBase64.slice(0, 32);
-  const cached = cacheGet(cacheKey);
+  // Use a more unique cache key — sample from middle and end of image, not just the start
+  // (JPEG headers are identical across photos from the same camera)
+  const len = imageBase64.length;
+  const cacheKey = 'id:' + imageBase64.slice(0, 16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
+  const cached = cacheGet(cacheKey, ID_TTL);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5',
       max_tokens: 400,
       messages: [{
         role: 'user',
@@ -246,9 +247,14 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 6) {
       messages
     });
 
+    console.log(`[agenticSearch] iter=${i} stop_reason=${response.stop_reason} content_types=${response.content.map(b=>b.type).join(',')}`);
+
     // Collect text from this turn
     const textBlocks = response.content.filter(b => b.type === 'text');
-    if (textBlocks.length) finalText = textBlocks.map(b => b.text).join('');
+    if (textBlocks.length) {
+      finalText = textBlocks.map(b => b.text).join('');
+      console.log(`[agenticSearch] text preview: ${finalText.slice(0,200)}`);
+    }
 
     if (response.stop_reason === 'end_turn') break;
 
@@ -256,24 +262,25 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 6) {
       const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
       if (!toolUseBlocks.length) break;
 
-      // Add the full assistant message (including tool_use blocks) to history
+      console.log(`[agenticSearch] tool_use blocks: ${toolUseBlocks.map(b=>b.name).join(',')}`);
+
+      // Add the full assistant message to history
       messages.push({ role: 'assistant', content: response.content });
 
-      // The web_search tool results are already embedded in response.content
-      // as tool_result blocks — pass them back as-is so Claude can read them
+      // Check for inline tool_result blocks first
       const toolResultBlocks = response.content.filter(b => b.type === 'tool_result');
+      console.log(`[agenticSearch] inline tool_result blocks: ${toolResultBlocks.length}`);
 
       if (toolResultBlocks.length) {
-        // Real results came back inline — add them as a user turn
         messages.push({ role: 'user', content: toolResultBlocks });
       } else {
-        // Fallback: acknowledge each tool use so the loop can continue
+        // Acknowledge each tool use to continue the loop
         messages.push({
           role: 'user',
           content: toolUseBlocks.map(b => ({
             type: 'tool_result',
             tool_use_id: b.id,
-            content: 'No results returned for this search.'
+            content: 'No results returned.'
           }))
         });
       }
@@ -282,6 +289,7 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 6) {
     break;
   }
 
+  console.log(`[agenticSearch] finalText length: ${finalText.length}`);
   return finalText;
 }
 
