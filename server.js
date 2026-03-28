@@ -126,17 +126,26 @@ app.post('/prices', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
   if (!checkRate(ip)) return res.status(429).json({ error: 'Too many requests.' });
 
-  const { card } = req.body;
+  const { card, ebayRegion = 'AU' } = req.body;
   if (!card?.name) return res.status(400).json({ error: 'No card data provided.' });
 
-  const cacheKey = `prices:${card.name}:${card.set}:${card.number}:${card.extra}`;
+  const cacheKey = `prices:${card.name}:${card.set}:${card.number}:${card.extra}:${ebayRegion}`;
   const cached = cacheGet(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
-  const thirdSource = card.game === 'Magic: The Gathering' ? 'MTGGoldfish' : 'Cardmarket';
-  const thirdQuery  = card.game === 'Magic: The Gathering'
-    ? `${card.name} mtggoldfish price`
-    : `${card.cardmarketQuery || card.name} cardmarket price`;
+  // eBay region config
+  const ebayRegions = {
+    AU: { domain: 'ebay.com.au',  currency: 'AUD', label: 'eBay Australia' },
+    US: { domain: 'ebay.com',     currency: 'USD', label: 'eBay USA' },
+    UK: { domain: 'ebay.co.uk',   currency: 'GBP', label: 'eBay UK' },
+    CA: { domain: 'ebay.ca',      currency: 'CAD', label: 'eBay Canada' },
+    DE: { domain: 'ebay.de',      currency: 'EUR', label: 'eBay Germany' },
+    JP: { domain: 'ebay.com',     currency: 'JPY', label: 'eBay Japan (via .com)' },
+  };
+  const ebayConf = ebayRegions[ebayRegion] || ebayRegions['AU'];
+
+  // Card Kingdom covers MTG, Pokemon, Yu-Gi-Oh, Lorcana etc.
+  const ckQuery = `${card.name} ${card.set || ''} site:cardkingdom.com`;
 
   const systemPrompt = `You are a trading card price research assistant. 
 Search for real current prices using web search, then respond ONLY with a JSON object — no explanation, no markdown fences.
@@ -153,8 +162,8 @@ Special: ${card.extra || ''}
 
 Do three separate web searches:
 1. "${card.tcgplayerQuery || card.name} tcgplayer price"
-2. "${card.ebayQuery || card.name} ebay australia sold"  
-3. "${thirdQuery}"
+2. "${card.ebayQuery || card.name} ${ebayConf.domain} sold"
+3. "${card.name} ${card.set || ''} card kingdom price"
 
 After searching, respond with ONLY this JSON structure (no markdown, no explanation):
 {
@@ -170,22 +179,22 @@ After searching, respond with ONLY this JSON structure (no markdown, no explanat
   "ebay": {
     "available": true,
     "recentSales": [
-      {"title": "card name listing", "price": 10.00, "currency": "AUD", "date": "2025-03", "condition": "Near Mint"}
+      {"title": "card name listing", "price": 10.00, "currency": "${ebayConf.currency}", "date": "2025-03", "condition": "Near Mint"}
     ],
     "low": 8.00,
     "avg": 11.00,
     "high": 15.00,
-    "currency": "AUD",
-    "url": "https://www.ebay.com.au/..."
+    "currency": "${ebayConf.currency}",
+    "region": "${ebayRegion}",
+    "regionLabel": "${ebayConf.label}",
+    "url": "https://www.${ebayConf.domain}/..."
   },
-  "cardmarket": {
+  "cardkingdom": {
     "available": true,
-    "low": 4.00,
-    "trend": 6.50,
-    "avg30": 6.00,
-    "currency": "EUR",
-    "url": "https://www.cardmarket.com/...",
-    "sourceName": "${thirdSource}"
+    "buylist": 3.00,
+    "retail": 8.00,
+    "currency": "USD",
+    "url": "https://www.cardkingdom.com/..."
   }
 }
 If a source has no data, set "available": false and all prices to null.`;
@@ -193,16 +202,21 @@ If a source has no data, set "available": false and all prices to null.`;
   try {
     const finalText = await agenticSearch(systemPrompt, userPrompt, 8);
 
-    // Parse the final JSON response
     let prices = parseJSON(finalText);
 
-    // Fallback if parsing failed
     if (!prices) {
       prices = {
         tcgplayer:   { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' },
-        ebay:        { available: false, recentSales: [], low: null, avg: null, high: null, currency: 'AUD' },
-        cardmarket:  { available: false, low: null, trend: null, avg30: null, currency: 'EUR', sourceName: thirdSource }
+        ebay:        { available: false, recentSales: [], low: null, avg: null, high: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label },
+        cardkingdom: { available: false, buylist: null, retail: null, currency: 'USD' }
       };
+    }
+
+    // Always stamp region info in case model omitted it
+    if (prices.ebay) {
+      prices.ebay.region      = ebayRegion;
+      prices.ebay.regionLabel = ebayConf.label;
+      prices.ebay.currency    = prices.ebay.currency || ebayConf.currency;
     }
 
     cacheSet(cacheKey, prices);
