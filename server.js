@@ -263,6 +263,88 @@ If cannot identify: {"error":"Cannot identify card"}`
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
+// POST /card-image
+// Fetches official card image from free databases (PokéTCG, Scryfall, YGOPRODeck)
+// ═════════════════════════════════════════════════════════════════════════════
+app.post('/card-image', async (req, res) => {
+  const { card } = req.body;
+  if (!card?.name) return res.status(400).json({ imageUrl: null });
+
+  const cacheKey = `img:${card.name}:${card.set}:${card.number}`;
+  const cached = await cacheGet(cacheKey, 60 * 60 * 48); // 48hr cache for images
+  if (cached) return res.json(cached);
+
+  let imageUrl = null;
+
+  try {
+    const game = (card.game || '').toLowerCase();
+
+    // ── Pokémon: PokéTCG API (free, no key for basic) ───────────────────────
+    if (game.includes('pokemon')) {
+      const q = encodeURIComponent(`name:"${card.name}"${card.number ? ` number:"${card.number.split('/')[0]}"` : ''}`);
+      const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=5`, {
+        'Accept': 'application/json'
+      });
+      if (r.status === 200) {
+        const data = JSON.parse(r.body);
+        const cards = data.data || [];
+        // Try to match by set name if possible
+        const match = cards.find(c =>
+          card.set && c.set?.name?.toLowerCase().includes(card.set.toLowerCase())
+        ) || cards[0];
+        if (match?.images?.large) imageUrl = match.images.large;
+        else if (match?.images?.small) imageUrl = match.images.small;
+      }
+    }
+
+    // ── Magic: The Gathering: Scryfall API (free) ────────────────────────────
+    else if (game.includes('magic')) {
+      const q = encodeURIComponent(`!"${card.name}"${card.set ? ` set:"${card.set}"` : ''}`);
+      const r = await httpGet(`https://api.scryfall.com/cards/search?q=${q}&order=released&dir=asc`, {
+        'Accept': 'application/json'
+      });
+      if (r.status === 200) {
+        const data = JSON.parse(r.body);
+        const match = data.data?.[0];
+        imageUrl = match?.image_uris?.normal || match?.image_uris?.small ||
+                   match?.card_faces?.[0]?.image_uris?.normal || null;
+      }
+    }
+
+    // ── Yu-Gi-Oh: YGOPRODeck API (free) ─────────────────────────────────────
+    else if (game.includes('yu-gi-oh') || game.includes('yugioh')) {
+      const q = encodeURIComponent(card.name);
+      const r = await httpGet(`https://db.ygoprodeck.com/api/v7/cardinfo.php?name=${q}`, {
+        'Accept': 'application/json'
+      });
+      if (r.status === 200) {
+        const data = JSON.parse(r.body);
+        imageUrl = data.data?.[0]?.card_images?.[0]?.image_url || null;
+      }
+    }
+
+    // ── Lorcana: Lorcana API ─────────────────────────────────────────────────
+    else if (game.includes('lorcana')) {
+      const q = encodeURIComponent(card.name);
+      const r = await httpGet(`https://api.lorcana-api.com/cards/fetch?search=${q}`, {
+        'Accept': 'application/json'
+      });
+      if (r.status === 200) {
+        const data = JSON.parse(r.body);
+        imageUrl = data?.[0]?.Image || null;
+      }
+    }
+
+  } catch (e) {
+    console.log('[card-image]', e.message);
+  }
+
+  const result = { imageUrl };
+  if (imageUrl) await cacheSet(cacheKey, result, 60 * 60 * 48);
+  return res.json(result);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // POST /prices  — scrape first, Claude fallback if scraping fails
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/prices', async (req, res) => {
