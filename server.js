@@ -1,91 +1,229 @@
 /**
  * TCG Price Scanner — Backend Server
- * -----------------------------------
- * Handles card identification (Claude Haiku vision) and price lookups
- * from TCGPlayer, eBay, and CardMarket / MTGGoldfish.
- *
- * Deploy on Railway, Render, or Vercel (see README.md)
+ * ------------------------------------
+ * - Card ID:     Claude Sonnet vision (~$0.004/scan)
+ * - Prices:      Direct scraping — NO web search fees ($0)
+ * - Cache:       Redis (persistent across redeploys) with in-memory fallback
+ * - Variants:    Claude Haiku knowledge (no web search)
  */
 
-const express = require('express');
-const cors    = require('cors');
+const express   = require('express');
+const cors      = require('cors');
+const https     = require('https');
+const http      = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const app  = express();
 const port = process.env.PORT || 3000;
-
-// ─── Anthropic client ────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ─── Simple in-memory cache (resets on redeploy — good enough) ───────────────
-const cache      = new Map();
-const CACHE_TTL  = 1000 * 60 * 60 * 6;  // 6 hours — for prices
-const ID_TTL     = 1000 * 60 * 60 * 1;  // 1 hour  — for identifications
+// ─── Redis cache (persistent) with in-memory fallback ────────────────────────
+let redisClient = null;
+const memCache  = new Map();
+const PRICE_TTL = 60 * 60 * 6;   // 6 hours
+const ID_TTL    = 60 * 60 * 24;  // 24 hours
 
-function cacheGet(key, ttl = CACHE_TTL) {
-  const hit = cache.get(key);
+async function initRedis() {
+  const url = process.env.REDIS_URL || process.env.REDIS_PRIVATE_URL;
+  if (!url) { console.log('[cache] No REDIS_URL — using in-memory'); return; }
+  try {
+    const { createClient } = require('redis');
+    redisClient = createClient({ url });
+    redisClient.on('error', e => console.error('[redis]', e.message));
+    await redisClient.connect();
+    console.log('[cache] Redis connected');
+  } catch (e) {
+    console.log('[cache] Redis failed, using memory:', e.message);
+    redisClient = null;
+  }
+}
+
+async function cacheGet(key) {
+  try {
+    if (redisClient) {
+      const val = await redisClient.get(key);
+      return val ? JSON.parse(val) : null;
+    }
+  } catch {}
+  const hit = memCache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.ts > ttl) { cache.delete(key); return null; }
+  if (Date.now() > hit.exp) { memCache.delete(key); return null; }
   return hit.data;
 }
-function cacheSet(key, data) { cache.set(key, { ts: Date.now(), data }); }
 
-// ─── Rate limiting (per IP — simple sliding window) ──────────────────────────
+async function cacheSet(key, data, ttl = PRICE_TTL) {
+  try {
+    if (redisClient) { await redisClient.set(key, JSON.stringify(data), { EX: ttl }); return; }
+  } catch {}
+  memCache.set(key, { data, exp: Date.now() + ttl * 1000 });
+}
+
+// ─── HTTP GET helper ─────────────────────────────────────────────────────────
+function httpGet(url, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const lib = parsed.protocol === 'https:' ? https : http;
+    const req = lib.get({
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1',
+        'Accept': 'text/html,application/json,*/*',
+        'Accept-Language': 'en-AU,en;q=0.9',
+        ...extraHeaders
+      },
+      timeout: 10000
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+// ─── Scrapers ────────────────────────────────────────────────────────────────
+async function scrapeTCGPlayer(card) {
+  try {
+    const q = encodeURIComponent(`${card.name} ${card.set || ''} ${card.number || ''}`);
+    const res = await httpGet(`https://www.tcgplayer.com/search/all/product?q=${q}&view=grid`);
+    if (res.status !== 200) return { available: false, market: null, currency: 'USD' };
+    const m = res.body.match(/"price"\s*:\s*"?([\d.]+)"?/) ||
+              res.body.match(/market-price[^>]*>\$?\s*([\d.]+)/) ||
+              res.body.match(/data-price="([\d.]+)"/);
+    if (m) return { available: true, market: parseFloat(m[1]), currency: 'USD' };
+    return { available: false, market: null, currency: 'USD' };
+  } catch (e) {
+    console.log('[tcg]', e.message);
+    return { available: false, market: null, currency: 'USD' };
+  }
+}
+
+const EBAY_REGIONS = {
+  AU: { domain: 'ebay.com.au', currency: 'AUD', label: 'eBay Australia' },
+  US: { domain: 'ebay.com',    currency: 'USD', label: 'eBay USA' },
+  UK: { domain: 'ebay.co.uk',  currency: 'GBP', label: 'eBay UK' },
+  CA: { domain: 'ebay.ca',     currency: 'CAD', label: 'eBay Canada' },
+  DE: { domain: 'ebay.de',     currency: 'EUR', label: 'eBay Germany' },
+  JP: { domain: 'ebay.com',    currency: 'USD', label: 'eBay (Intl)' },
+};
+
+async function scrapeEbay(card, region = 'AU') {
+  const conf = EBAY_REGIONS[region] || EBAY_REGIONS['AU'];
+  try {
+    const q = encodeURIComponent(card.ebayQuery || `${card.name} ${card.set || ''} ${card.number || ''}`);
+    const url = `https://www.${conf.domain}/sch/i.html?_nkw=${q}&LH_Sold=1&LH_Complete=1&_sop=13&rt=nc&_ipg=20`;
+    const res = await httpGet(url);
+    if (res.status !== 200) return { available: false, avg: null, currency: conf.currency, region, regionLabel: conf.label };
+
+    const prices = [...res.body.matchAll(/s-item__price[^>]*>[^<]*?([\d,]+\.\d{2})/g)]
+      .map(m => parseFloat(m[1].replace(/,/g, '')))
+      .filter(p => p > 0.5 && p < 50000);
+
+    if (!prices.length) return { available: false, avg: null, currency: conf.currency, region, regionLabel: conf.label };
+    const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
+    return { available: true, avg: Math.round(avg * 100) / 100, currency: conf.currency, region, regionLabel: conf.label };
+  } catch (e) {
+    console.log('[ebay]', e.message);
+    return { available: false, avg: null, currency: conf.currency, region, regionLabel: conf.label };
+  }
+}
+
+async function scrapeCardKingdom(card) {
+  try {
+    const q = encodeURIComponent(`${card.name} ${card.set || ''}`);
+    const res = await httpGet(`https://www.cardkingdom.com/catalog/search?search=header&filter%5Bname%5D=${q}`);
+    if (res.status !== 200) return { available: false, retail: null, currency: 'USD' };
+    const m = res.body.match(/class="productItemPrice"[^>]*>\s*\$([\d.]+)/) ||
+              res.body.match(/addToCart[^$]*\$([\d.]+)/) ||
+              res.body.match(/\$\s*([\d]+\.\d{2})/);
+    if (m) return { available: true, retail: parseFloat(m[1]), currency: 'USD' };
+    return { available: false, retail: null, currency: 'USD' };
+  } catch (e) {
+    console.log('[ck]', e.message);
+    return { available: false, retail: null, currency: 'USD' };
+  }
+}
+
+// Fallback: Claude Haiku price estimate from training data (no web search)
+async function claudePriceFallback(card, ebayRegion = 'AU') {
+  const currency = EBAY_REGIONS[ebayRegion]?.currency || 'AUD';
+  const label    = EBAY_REGIONS[ebayRegion]?.label    || 'eBay';
+  try {
+    const r = await withRetry(() => anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 250,
+      messages: [{
+        role: 'user',
+        content: `Approximate market prices for: ${card.name}, ${card.set || ''}, ${card.number || ''}, ${card.rarity || ''}
+Respond ONLY with JSON (no markdown):
+{"tcgplayer":{"available":true,"market":5.00,"currency":"USD","isEstimate":true},"ebay":{"available":true,"avg":8.00,"currency":"${currency}","region":"${ebayRegion}","regionLabel":"${label}","isEstimate":true},"cardkingdom":{"available":true,"retail":6.00,"currency":"USD","isEstimate":true}}
+Use null and available:false for anything you don't know.`
+      }]
+    }));
+    const raw = r.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
+    return parseJSON(raw) || defaultPrices(currency, ebayRegion, label);
+  } catch { return defaultPrices(currency, ebayRegion, label); }
+}
+
+function defaultPrices(currency, region, label) {
+  return {
+    tcgplayer:   { available: false, market: null, currency: 'USD' },
+    ebay:        { available: false, avg: null, currency, region, regionLabel: label },
+    cardkingdom: { available: false, retail: null, currency: 'USD' }
+  };
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 const rateMap = new Map();
-const RATE_WINDOW = 60_000;   // 1 minute
-const RATE_LIMIT  = 60;       // requests per minute per IP
-
-function checkRate(ip) {
+function checkRate(ip, limit = 30) {
   const now  = Date.now();
-  const hits = (rateMap.get(ip) || []).filter(t => now - t < RATE_WINDOW);
-  if (hits.length >= RATE_LIMIT) return false;
+  const hits = (rateMap.get(ip) || []).filter(t => now - t < 60000);
+  if (hits.length >= limit) return false;
   hits.push(now);
   rateMap.set(ip, hits);
   return true;
 }
 
-// ─── Retry with exponential backoff for 429s ─────────────────────────────────
-async function withRetry(fn, maxRetries = 3) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const is429 = err?.status === 429 || err?.message?.includes('429') || err?.message?.includes('rate limit');
-      if (is429 && attempt < maxRetries) {
-        const wait = (attempt + 1) * 3000; // 3s, 6s, 9s
-        console.log(`[retry] 429 hit, waiting ${wait}ms before retry ${attempt + 1}`);
-        await new Promise(r => setTimeout(r, wait));
-        continue;
-      }
+async function withRetry(fn, retries = 3) {
+  for (let i = 0; i <= retries; i++) {
+    try { return await fn(); }
+    catch (err) {
+      const is429 = err?.status === 429 || String(err?.message).includes('429');
+      if (is429 && i < retries) { await new Promise(r => setTimeout(r, (i + 1) * 3000)); continue; }
       throw err;
     }
   }
 }
 
+function parseJSON(text) {
+  try {
+    const m = (text || '').replace(/```json|```/g, '').trim().match(/[\[{][\s\S]*[\]}]/);
+    return m ? JSON.parse(m[0]) : null;
+  } catch { return null; }
+}
 
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: '12mb' }));
-
-// ─── Health check ─────────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ status: 'ok', service: 'TCG Price Scanner API' }));
+app.get('/', (_, res) => res.json({ status: 'ok', service: 'TCG Price Scanner API' }));
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: POST /identify
-// Body: { imageBase64: string, mediaType?: string }
-// Returns: card identification JSON
+// POST /identify
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/identify', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
-  if (!checkRate(ip)) return res.status(429).json({ error: 'Too many scans — wait a moment and try again.' });
+  if (!checkRate(ip, 20)) return res.status(429).json({ error: 'Too many scans — wait a moment.' });
 
   const { imageBase64, mediaType = 'image/jpeg' } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
-  // Use a more unique cache key — sample from middle and end of image, not just the start
-  // (JPEG headers are identical across photos from the same camera)
   const len = imageBase64.length;
-  const cacheKey = 'id:' + imageBase64.slice(0, 16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
-  const cached = cacheGet(cacheKey, ID_TTL);
+  const cacheKey = 'id:' + imageBase64.slice(0, 16) + imageBase64.slice(Math.floor(len / 2), Math.floor(len / 2) + 16) + imageBase64.slice(-16);
+  const cached = await cacheGet(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
@@ -95,42 +233,20 @@ app.post('/identify', async (req, res) => {
       messages: [{
         role: 'user',
         content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: mediaType, data: imageBase64 }
-          },
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
           {
             type: 'text',
-            text: `You are an expert trading card identifier. Your job is to READ THE EXACT TEXT printed on this card — do not guess or rely on memory.
+            text: `You are an expert trading card identifier. READ THE EXACT TEXT printed on this card.
 
-IMPORTANT RULES:
-- Read the card number exactly as printed (e.g. "120/124" not "151/165")
-- Read the set name exactly as printed at the bottom of the card
-- Read the card name exactly as printed at the top
-- Do NOT confuse similar cards — check the number and set carefully
-- If the card number is visible, always include it
+RULES:
+- Read card number exactly as printed (e.g. "120/124")
+- Read set name exactly as printed at the bottom
+- Read card name exactly as printed at the top
+- Do NOT confuse similar cards
 
-Respond ONLY with valid JSON — no markdown, no explanation.
-
-If you can identify the card:
-{
-  "name": "exact card name as printed",
-  "game": "Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other",
-  "set": "exact set name as printed on card",
-  "number": "exact card number as printed (e.g. 120/124)",
-  "rarity": "rarity as printed or inferred from symbol",
-  "year": "year printed or null",
-  "condition": "Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played",
-  "foil": true or false,
-  "extra": "1st Edition / Shadowless / PSA graded / etc — or null",
-  "confidence": "high | medium | low",
-  "tcgplayerQuery": "card name + set name + number for TCGPlayer search",
-  "ebayQuery": "card name + set name + number for eBay search",
-  "cardmarketQuery": "card name + set name for Cardmarket search"
-}
-
-If you cannot identify it:
-{"error": "Cannot identify card"}`
+Respond ONLY with JSON, no markdown:
+{"name":"exact name","game":"Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other","set":"exact set name","number":"exact number e.g. 120/124","rarity":"rarity or null","year":"year or null","condition":"Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played","foil":true,"extra":"1st Edition or null","confidence":"high | medium | low","tcgplayerQuery":"name set number","ebayQuery":"name set number for ebay","cardmarketQuery":"name set"}
+If cannot identify: {"error":"Cannot identify card"}`
           }
         ]
       }]
@@ -138,9 +254,8 @@ If you cannot identify it:
 
     const raw  = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
     const card = JSON.parse(raw);
-    if (!card.error) cacheSet(cacheKey, card);
+    if (!card.error) await cacheSet(cacheKey, card, ID_TTL);
     return res.json(card);
-
   } catch (err) {
     console.error('identify error:', err.message);
     return res.status(500).json({ error: err.message || 'Identification failed.' });
@@ -148,259 +263,79 @@ If you cannot identify it:
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: POST /prices
-// Runs all 3 source lookups in parallel for maximum speed
+// POST /prices  — scrape first, Claude fallback if scraping fails
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/prices', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
-  if (!checkRate(ip)) return res.status(429).json({ error: 'Too many requests.' });
+  if (!checkRate(ip, 30)) return res.status(429).json({ error: 'Too many requests.' });
 
   const { card, ebayRegion = 'AU' } = req.body;
-  if (!card?.name) return res.status(400).json({ error: 'No card data provided.' });
+  if (!card?.name) return res.status(400).json({ error: 'No card data.' });
 
-  const cacheKey = `prices:${card.name}:${card.set}:${card.number}:${card.extra}:${ebayRegion}`;
-  const cached = cacheGet(cacheKey);
+  const cacheKey = `prices3:${card.name}:${card.set}:${card.number}:${ebayRegion}`;
+  const cached = await cacheGet(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
-  const ebayRegions = {
-    AU: { domain: 'ebay.com.au', currency: 'AUD', label: 'eBay Australia' },
-    US: { domain: 'ebay.com',    currency: 'USD', label: 'eBay USA' },
-    UK: { domain: 'ebay.co.uk',  currency: 'GBP', label: 'eBay UK' },
-    CA: { domain: 'ebay.ca',     currency: 'CAD', label: 'eBay Canada' },
-    DE: { domain: 'ebay.de',     currency: 'EUR', label: 'eBay Germany' },
-    JP: { domain: 'ebay.com',    currency: 'JPY', label: 'eBay Japan (via .com)' },
-  };
-  const ebayConf = ebayRegions[ebayRegion] || ebayRegions['AU'];
+  const [tcgplayer, ebay, cardkingdom] = await Promise.all([
+    scrapeTCGPlayer(card),
+    delay(300).then(() => scrapeEbay(card, ebayRegion)),
+    delay(600).then(() => scrapeCardKingdom(card))
+  ]);
 
-  // ── Search functions — each runs independently in parallel ──────────────────
+  let prices = { tcgplayer, ebay, cardkingdom };
 
-  async function searchTCGPlayer() {
-    const cKey = `tcg:${card.name}:${card.set}:${card.number}`;
-    const hit = cacheGet(cKey);
-    if (hit) return hit;
-    try {
-      const text = await agenticSearch(
-        'You are a trading card price researcher. Search and respond ONLY with JSON, no markdown.',
-        `Search TCGPlayer for the current market price of this card:
-Card: ${card.name}, Set: ${card.set || ''}, Number: ${card.number || ''}, Rarity: ${card.rarity || ''}
-Search: "${card.tcgplayerQuery || card.name} tcgplayer"
-
-Respond ONLY with this JSON:
-{"available":true,"market":7.50,"currency":"USD","url":"https://www.tcgplayer.com/..."}
-If not found: {"available":false,"market":null,"currency":"USD"}`, 5
-      );
-      const result = parseJSON(text) || { available: false, market: null, currency: 'USD' };
-      cacheSet(cKey, result);
-      return result;
-    } catch { return { available: false, market: null, currency: 'USD' }; }
+  if (!tcgplayer.available && !ebay.available && !cardkingdom.available) {
+    console.log('[prices] all scrapers failed, using Claude fallback');
+    prices = await claudePriceFallback(card, ebayRegion);
   }
 
-  async function searchEbay() {
-    const cKey = `ebay:${card.name}:${card.set}:${card.number}:${ebayRegion}`;
-    const hit = cacheGet(cKey);
-    if (hit) return hit;
-    try {
-      const text = await agenticSearch(
-        'You are a trading card price researcher. Search eBay sold listings and respond ONLY with JSON, no markdown.',
-        `Search ${ebayConf.label} sold listings for this card and find the average sold price:
-Card: ${card.name}, Set: ${card.set || ''}, Number: ${card.number || ''}
-Search: "${card.ebayQuery || card.name} ${ebayConf.domain} sold"
-
-Respond ONLY with this JSON:
-{"available":true,"avg":11.00,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}","url":"https://www.${ebayConf.domain}/..."}
-If not found: {"available":false,"avg":null,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}"}`, 5
-      );
-      const result = parseJSON(text) || { available: false, avg: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label };
-      result.region      = ebayRegion;
-      result.regionLabel = ebayConf.label;
-      result.currency    = result.currency || ebayConf.currency;
-      cacheSet(cKey, result);
-      return result;
-    } catch { return { available: false, avg: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label }; }
-  }
-
-  async function searchCardKingdom() {
-    const cKey = `ck:${card.name}:${card.set}`;
-    const hit = cacheGet(cKey);
-    if (hit) return hit;
-    try {
-      const text = await agenticSearch(
-        'You are a trading card price researcher. Search Card Kingdom and respond ONLY with JSON, no markdown.',
-        `Search Card Kingdom for the current retail price of this card:
-Card: ${card.name}, Set: ${card.set || ''}
-Search: "${card.name} ${card.set || ''} card kingdom"
-
-Respond ONLY with this JSON:
-{"available":true,"retail":8.00,"currency":"USD","url":"https://www.cardkingdom.com/..."}
-If not found: {"available":false,"retail":null,"currency":"USD"}`, 5
-      );
-      const result = parseJSON(text) || { available: false, retail: null, currency: 'USD' };
-      cacheSet(cKey, result);
-      return result;
-    } catch { return { available: false, retail: null, currency: 'USD' }; }
-  }
-
-  try {
-    // Stagger starts by 500ms each to avoid hitting rate limits simultaneously
-    const delay = ms => new Promise(r => setTimeout(r, ms));
-    const [tcgplayer, ebay, cardkingdom] = await Promise.all([
-      searchTCGPlayer(),
-      delay(500).then(() => searchEbay()),
-      delay(1000).then(() => searchCardKingdom())
-    ]);
-
-    const prices = { tcgplayer, ebay, cardkingdom };
-    cacheSet(cacheKey, prices);
-    return res.json(prices);
-
-  } catch (err) {
-    console.error('prices error:', err.message);
-    return res.status(500).json({ error: err.message || 'Price lookup failed.' });
-  }
+  await cacheSet(cacheKey, prices);
+  return res.json(prices);
 });
 
-
 // ═════════════════════════════════════════════════════════════════════════════
-// HELPER: web search — server-side tool, Anthropic handles results automatically
-// ═════════════════════════════════════════════════════════════════════════════
-async function agenticSearch(systemPrompt, userPrompt, maxIter = 5) {
-  const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
-  let messages = [{ role: 'user', content: userPrompt }];
-  let finalText = '';
-
-  for (let i = 0; i < maxIter; i++) {
-    const response = await withRetry(() => anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: systemPrompt,
-      tools,
-      messages
-    }));
-
-    console.log(`[search] iter=${i} stop=${response.stop_reason} blocks=${response.content.map(b=>b.type).join(',')}`);
-
-    // Collect any text blocks
-    for (const block of response.content) {
-      if (block.type === 'text') finalText += block.text;
-    }
-
-    // If done, return
-    if (response.stop_reason === 'end_turn') {
-      console.log(`[search] done. text=${finalText.slice(0,300)}`);
-      break;
-    }
-
-    // For server-side tools (web_search), append the full response as assistant
-    // turn and continue — Anthropic has already handled the search internally
-    if (response.stop_reason === 'tool_use') {
-      messages.push({ role: 'assistant', content: response.content });
-      // No need to add tool_result — server-side tools are self-contained
-      // Just ask Claude to continue with what it found
-      messages.push({ role: 'user', content: 'Please now provide your JSON answer based on the search results.' });
-      continue;
-    }
-
-    break;
-  }
-
-  return finalText;
-}
-
-function parseJSON(text) {
-  try {
-    const cleaned = text.replace(/```json|```/g, '').trim();
-    const match = cleaned.match(/[\[{][\s\S]*[\]}]/);
-    return match ? JSON.parse(match[0]) : null;
-  } catch { return null; }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// ROUTE: POST /variants
-// Body: { card: { name, game, set, number, rarity } }
-// Returns: array of all known set versions with avg prices
+// POST /variants  — Claude Haiku knowledge + eBay scraping
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/variants', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
-  if (!checkRate(ip)) return res.status(429).json({ error: 'Too many requests.' });
+  if (!checkRate(ip, 10)) return res.status(429).json({ error: 'Too many requests.' });
 
   const { card } = req.body;
-  if (!card?.name) return res.status(400).json({ error: 'No card data provided.' });
+  if (!card?.name) return res.status(400).json({ error: 'No card data.' });
 
-  const cacheKey = `variants:${card.name}:${card.game}`;
-  const cached = cacheGet(cacheKey);
+  const cacheKey = `variants3:${card.name}:${card.game}`;
+  const cached = await cacheGet(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
-    // Step 1 — find all sets this card appeared in
-    const setsText = await agenticSearch(
-      `You are a trading card game expert. Search for all versions of a card across every set it appeared in. Respond ONLY with a JSON array — no markdown, no explanation.`,
-      `Search for every set and version that "${card.name}" (${card.game}) has appeared in.
+    const response = await withRetry(() => anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 1500,
+      messages: [{
+        role: 'user',
+        content: `List every known printing of: ${card.name} (${card.game})
+Return JSON array, max 12, most valuable first. No markdown:
+[{"set":"Base Set","year":"1999","number":"4/102","rarity":"Rare Holo","variant":"Shadowless","ebayQuery":"${card.name} Base Set Shadowless Holo 4/102"}]
+Include: different sets, promos, alt arts, 1st edition, regional variants.`
+      }]
+    }));
 
-Search: "${card.name} ${card.game} all sets versions printings"
+    const raw = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
+    const versions = parseJSON(raw);
+    if (!Array.isArray(versions) || !versions.length) return res.json({ variants: [] });
 
-Return a JSON array of every known version:
-[
-  {
-    "set": "Base Set",
-    "year": "1999",
-    "number": "4/102",
-    "rarity": "Rare Holo",
-    "variant": "Shadowless",
-    "ebayQuery": "Charizard Base Set Shadowless Holo Rare 4/102"
-  },
-  {
-    "set": "Base Set 2",
-    "year": "2000", 
-    "number": "4/130",
-    "rarity": "Rare Holo",
-    "variant": null,
-    "ebayQuery": "Charizard Base Set 2 Holo Rare 4/130"
-  }
-]
-
-Include ALL printings: different sets, promos, alternate arts, 1st edition, unlimited, shadowless, etc.
-Keep the array to a maximum of 15 most notable/valuable versions.`,
-      8
+    const results = await Promise.all(
+      versions.slice(0, 12).map(async (v, i) => {
+        await delay(i * 250);
+        const vKey = `vprice3:${card.name}:${v.set}:${v.variant || ''}`;
+        const vCached = await cacheGet(vKey);
+        if (vCached) return { ...v, ...vCached };
+        const priceData = await scrapeEbay({ ...card, ebayQuery: v.ebayQuery || `${card.name} ${v.set}` }, 'AU');
+        await cacheSet(vKey, priceData);
+        return { ...v, ...priceData };
+      })
     );
 
-    let versions = parseJSON(setsText);
-    if (!Array.isArray(versions) || !versions.length) {
-      return res.json({ variants: [], error: 'Could not find variant data.' });
-    }
-
-    // Step 2 — fetch eBay AU avg price for each version in parallel (max 8 at once)
-    const BATCH = 8;
-    const results = [];
-
-    for (let i = 0; i < Math.min(versions.length, 15); i += BATCH) {
-      const batch = versions.slice(i, i + BATCH);
-      const pricePromises = batch.map(async (v) => {
-        const vCacheKey = `vprice:${card.name}:${v.set}:${v.variant || ''}`;
-        const vCached = cacheGet(vCacheKey);
-        if (vCached) return { ...v, ...vCached };
-
-        try {
-          const priceText = await agenticSearch(
-            `You are a trading card price researcher. Search eBay Australia sold listings and respond ONLY with JSON — no markdown.`,
-            `Search eBay Australia sold listings for: "${v.ebayQuery || `${card.name} ${v.set}`}"
-Find the average sold price. Respond with ONLY this JSON:
-{"available":true,"avg":10.00,"currency":"AUD"}
-If no sales found: {"available":false,"avg":null,"currency":"AUD"}`,
-            5
-          );
-          const priceData = parseJSON(priceText) || { available: false, avg: null, currency: 'AUD' };
-          cacheSet(vCacheKey, priceData);
-          return { ...v, ...priceData };
-        } catch {
-          return { ...v, available: false, avg: null, currency: 'AUD' };
-        }
-      });
-
-      const batchResults = await Promise.all(pricePromises);
-      results.push(...batchResults);
-    }
-
-    // Sort by avg price descending (most valuable first), unavailable last
     results.sort((a, b) => {
       if (!a.available && b.available) return 1;
       if (a.available && !b.available) return -1;
@@ -408,55 +343,46 @@ If no sales found: {"available":false,"avg":null,"currency":"AUD"}`,
     });
 
     const payload = { variants: results };
-    cacheSet(cacheKey, payload);
+    await cacheSet(cacheKey, payload);
     return res.json(payload);
-
   } catch (err) {
     console.error('variants error:', err.message);
     return res.status(500).json({ error: err.message || 'Variant lookup failed.' });
   }
 });
 
-
-// Body: { card, prices, condition, askingPrice }
-// Returns: { title, description }
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /generate-listing
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/generate-listing', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
-  if (!checkRate(ip)) return res.status(429).json({ error: 'Too many requests.' });
+  if (!checkRate(ip, 10)) return res.status(429).json({ error: 'Too many requests.' });
 
-  const { card, prices, condition, askingPrice } = req.body;
+  const { card, condition, askingPrice } = req.body;
   if (!card?.name) return res.status(400).json({ error: 'No card data.' });
 
   try {
-    const response = await anthropic.messages.create({
+    const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-haiku-4-5',
       max_tokens: 600,
       messages: [{
         role: 'user',
-        content: `Write a compelling eBay Australia trading card listing. Respond ONLY with JSON (no markdown):
-{"title":"80 char max keyword-rich eBay title","description":"150-220 word professional listing with condition, postage note, and SEO keywords"}
-
-Card: ${card.name}
-Game: ${card.game}
-Set: ${card.set || ''}
-Number: ${card.number || ''}
-Rarity: ${card.rarity || ''}
-Foil: ${card.foil ? 'Yes' : 'No'}
-Special: ${card.extra || 'None'}
-Condition: ${condition}
-Asking price: $${askingPrice} AUD`
+        content: `Write an eBay Australia trading card listing. ONLY JSON, no markdown:
+{"title":"80 char eBay title","description":"150-200 word listing with condition, postage, SEO"}
+Card: ${card.name}, ${card.game}, ${card.set || ''}, #${card.number || ''}, ${card.rarity || ''}, Foil:${card.foil}, ${card.extra || ''}
+Condition: ${condition}, Price: $${askingPrice} AUD`
       }]
-    });
+    }));
 
     const raw = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
-    const gen = JSON.parse(raw);
-    return res.json(gen);
-
+    return res.json(JSON.parse(raw));
   } catch (err) {
     console.error('listing error:', err.message);
     return res.status(500).json({ error: err.message || 'Listing generation failed.' });
   }
 });
 
-app.listen(port, () => console.log(`TCG Scanner API running on port ${port}`));
+// ─── Start ────────────────────────────────────────────────────────────────────
+initRedis().then(() => {
+  app.listen(port, () => console.log(`TCG Scanner API running on port ${port}`));
+});
