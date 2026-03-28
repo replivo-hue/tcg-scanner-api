@@ -190,20 +190,32 @@ async function fetchCardImage(card) {
   // ── Pokémon: PokéTCG API ────────────────────────────────────────────────────
   if (game.includes('pokemon')) {
     try {
-      // Search by name + card number for precision
-      const nameQ = card.name.replace(/[^a-zA-Z0-9 ]/g, '').trim();
-      const numQ  = card.number ? card.number.split('/')[0] : '';
-      const q     = encodeURIComponent(`name:"${nameQ}"${numQ ? ` number:"${numQ}"` : ''}`);
-      const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=10&orderBy=-set.releaseDate`);
-      if (r.status === 200) {
-        const data = JSON.parse(r.body);
-        const cards = data.data || [];
-        // Prefer set match
-        const match = cards.find(c =>
-          card.set && c.set?.name?.toLowerCase().includes(card.set.toLowerCase().split(' ')[0])
-        ) || cards[0];
+      const nameQ = card.name.replace(/[^a-zA-Z0-9 '-]/g, '').trim();
+      const numQ  = card.number ? card.number.split('/')[0].replace(/[^a-zA-Z0-9]/g, '') : '';
+
+      // Strategy 1: name + number (most precise)
+      if (numQ) {
+        const q = encodeURIComponent(`name:"${nameQ}" number:${numQ}`);
+        const r = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q}&pageSize=20`);
+        if (r.status === 200) {
+          const cards = (JSON.parse(r.body).data || []);
+          // Prefer set name match, else first result
+          const setWord = (card.set || '').toLowerCase().split(' ')[0];
+          const match = cards.find(c => setWord && c.set?.name?.toLowerCase().includes(setWord)) || cards[0];
+          const url = match?.images?.large || match?.images?.small;
+          if (url) { console.log('[img pokemon] matched via name+number'); return url; }
+        }
+      }
+
+      // Strategy 2: name only (loose), then filter by set
+      const q2 = encodeURIComponent(`name:"${nameQ}"`);
+      const r2 = await httpGet(`https://api.pokemontcg.io/v2/cards?q=${q2}&pageSize=20&orderBy=-set.releaseDate`);
+      if (r2.status === 200) {
+        const cards = (JSON.parse(r2.body).data || []);
+        const setWord = (card.set || '').toLowerCase().split(' ')[0];
+        const match = cards.find(c => setWord && c.set?.name?.toLowerCase().includes(setWord)) || cards[0];
         const url = match?.images?.large || match?.images?.small;
-        if (url) return url;
+        if (url) { console.log('[img pokemon] matched via name-only'); return url; }
       }
     } catch (e) { console.log('[img pokemon]', e.message); }
   }
@@ -211,13 +223,25 @@ async function fetchCardImage(card) {
   // ── Magic: The Gathering: Scryfall ──────────────────────────────────────────
   if (game.includes('magic')) {
     try {
-      const q = encodeURIComponent(`!"${card.name}"`);
+      // /cards/named?fuzzy= expects a plain name, not search syntax
+      const q = encodeURIComponent(card.name);
       const r = await httpGet(`https://api.scryfall.com/cards/named?fuzzy=${q}`);
       if (r.status === 200) {
         const data = JSON.parse(r.body);
+        // Prefer set-specific print if we have a set code / set name
+        if (card.set) {
+          // Try exact set lookup: /cards/named?fuzzy=NAME&set=XXX
+          const setSlug = card.set.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 6);
+          const r2 = await httpGet(`https://api.scryfall.com/cards/named?fuzzy=${q}&set=${encodeURIComponent(setSlug)}`);
+          if (r2.status === 200) {
+            const d2 = JSON.parse(r2.body);
+            const url2 = d2?.image_uris?.normal || d2?.card_faces?.[0]?.image_uris?.normal;
+            if (url2) { console.log('[img scryfall] matched with set'); return url2; }
+          }
+        }
         const url = data?.image_uris?.normal || data?.image_uris?.small ||
                     data?.card_faces?.[0]?.image_uris?.normal;
-        if (url) return url;
+        if (url) { console.log('[img scryfall] matched by name'); return url; }
       }
     } catch (e) { console.log('[img scryfall]', e.message); }
   }
@@ -283,34 +307,47 @@ app.post('/identify', async (req, res) => {
           { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
           {
             type: 'text',
-            text: `You are an expert trading card identifier. Your ONLY job is to read the exact text printed on this card image.
+            text: `You are an expert trading card identifier. Read the text PRINTED ON THIS CARD precisely.
 
-CRITICAL RULES — follow these exactly:
-1. Read the CARD NAME exactly as printed at the top of the card
-2. Read the CARD NUMBER exactly as printed (bottom right, e.g. "120/124" or "SV122")  
-3. Read the SET NAME exactly as printed (bottom of card, near copyright)
-4. Read the RARITY symbol (common/uncommon/rare/ultra rare/secret rare etc.)
-5. Do NOT guess — if you can see text, read it. If you cannot see it clearly, say so in confidence field.
-6. For Pokemon: the set name is at the very bottom near the copyright line
-7. The card number tells you exactly which printing this is — read it carefully
+STEP 1 — IDENTIFY THE GAME first (look at card layout, back design, copyright text):
+- Pokémon: yellow border, HP top-right, "Pokémon TCG" or "©Nintendo" at bottom
+- Magic: The Gathering: black/coloured border, mana symbols, "™ & © Wizards of the Coast"
+- Yu-Gi-Oh!: dark border, ATK/DEF stats, "KONAMI" at bottom
+- Lorcana: ink-drop symbol, Disney copyright
+- One Piece: "ONE PIECE CARD GAME" text, Bandai copyright
+
+STEP 2 — READ THESE FIELDS in order of reliability (most → least):
+1. CARD NUMBER (bottom-right corner, e.g. "120/124", "SV122", "TG20/TG30") — THIS IS THE MOST IMPORTANT FIELD. Read every digit precisely.
+2. CARD NAME (top of card, exactly as printed including punctuation like Farfetch'd, Mr. Mime, etc.)
+3. SET SYMBOL (bottom-left icon — identify the set name it corresponds to)
+4. SET NAME (near copyright at very bottom — for Pokémon this is tiny text e.g. "Scarlet & Violet—Paradox Rift")
+5. RARITY (symbol: circle=common, diamond=uncommon, star=rare, star+H=holo rare, etc.)
+6. FOIL (does the card surface have a holographic/rainbow/shiny finish?)
+7. SPECIAL PRINTING (1st Edition stamp, Full Art, Alt Art, Shadowless, etc.)
+
+CRITICAL RULES:
+- If a field is UNCLEAR or partially visible, set it to null — NEVER invent or guess set names/numbers
+- The card number uniquely identifies the exact printing — if you can read it, the set is deterministic
+- For Pokémon: the set abbreviation appears before the slash in newer cards (e.g. "SVI 001/198" = Scarlet & Violet base)
+- For condition: judge from photo quality/card edges (scratches, whitening, creases)
 
 Respond ONLY with valid JSON, no markdown:
 {
   "name": "exact name from card",
   "game": "Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other",
-  "set": "exact set name from card",
-  "number": "exact number e.g. 120/124",
-  "rarity": "rarity symbol/text or null",
+  "set": "exact set name, or null if unreadable",
+  "number": "exact number e.g. 120/124 or SV122, or null if unreadable",
+  "rarity": "rarity text/symbol or null",
   "year": "copyright year or null",
   "condition": "Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played",
   "foil": true or false,
   "extra": "1st Edition / Shadowless / Full Art / Alt Art / Secret Rare / etc or null",
   "confidence": "high | medium | low",
-  "tcgplayerQuery": "exact name + set + number",
-  "ebayQuery": "exact name + set + number optimised for sold listings",
-  "cardmarketQuery": "exact name + set"
+  "tcgplayerQuery": "name + set + number",
+  "ebayQuery": "name + set + number optimised for eBay sold listings",
+  "cardmarketQuery": "name + set"
 }
-If you cannot identify: {"error":"Cannot identify card"}`
+If card is not visible or too blurry to identify: {"error":"Cannot identify card"}`
           }
         ]
       }]
