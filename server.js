@@ -49,20 +49,23 @@ async function cacheSet(key, data, ttl = 21600) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function httpGet(url, headers = {}) {
+function httpGet(url, headers = {}, binary = false) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const lib = u.protocol === 'https:' ? https : http;
     const req = lib.get({
       hostname: u.hostname, path: u.pathname + u.search,
-      headers: { 'User-Agent': 'TCGScanner/4.0', 'Accept': 'application/json', ...headers },
+      headers: { 'User-Agent': 'TCGScanner/4.0', 'Accept': binary ? 'image/*' : 'application/json', ...headers },
       timeout: 10000
     }, res => {
       if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location)
-        return httpGet(res.headers.location, headers).then(resolve).catch(reject);
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => resolve({ status: res.statusCode, body }));
+        return httpGet(res.headers.location, headers, binary).then(resolve).catch(reject);
+      const chunks = [];
+      res.on('data', c => chunks.push(typeof c === 'string' ? Buffer.from(c) : c));
+      res.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        resolve({ status: res.statusCode, body: binary ? buf.toString('base64') : buf.toString('utf8') });
+      });
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
@@ -286,6 +289,61 @@ async function lookupCard(card) {
   return result;
 }
 
+// ─── Card number verification ────────────────────────────────────────────────
+// Fetches the official card image and asks Claude to read the number from it.
+// If it doesn't match what /identify returned, we correct it.
+// Only runs when: official image exists + card has a number + not cached.
+async function verifyCardNumber(card, officialImageUrl) {
+  // Nothing to verify if no number was found or no official image
+  if (!card.number || !officialImageUrl) return null;
+
+  try {
+    // Fetch official image as base64 directly
+    const r = await httpGet(officialImageUrl, {}, true);  // binary=true
+    if (r.status !== 200) return null;
+
+    const imgBase64 = r.body;  // already base64 from httpGet binary mode
+
+    // Detect media type from URL
+    const mediaType = officialImageUrl.includes('.png') ? 'image/png' : 'image/jpeg';
+
+    // Ask Claude to read just the number from the official image
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',   // Haiku is fast + cheap for this simple read
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: imgBase64 } },
+          { type: 'text',  text: `What is the card number printed on this trading card? It appears in the bottom-right corner (e.g. "4/102", "110/113", "SV122").
+Respond ONLY with JSON: {"number":"4/102"} or {"number":null} if unreadable.` }
+        ]
+      }]
+    });
+
+    const raw = response.content.map(b => b.text || '').join('').replace(/```json|```/g, '').trim();
+    const result = JSON.parse(raw);
+    const officialNumber = result?.number || null;
+
+    if (!officialNumber) return null;
+
+    // Compare — normalise both to remove spaces/dashes for comparison
+    const norm = s => (s || '').replace(/[\s\-]/g, '').toLowerCase();
+    const matches = norm(officialNumber) === norm(card.number);
+
+    console.log(`[verify] scan="${card.number}" official="${officialNumber}" match=${matches}`);
+
+    return {
+      officialNumber,
+      matches,
+      corrected: !matches   // flag so frontend knows it was corrected
+    };
+  } catch (e) {
+    console.log('[verify] error:', e.message);
+    return null;   // verification failed — don't block the response
+  }
+}
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: '12mb' }));
@@ -402,12 +460,35 @@ app.post('/prices', async (req, res) => {
     isEstimate: false
   };
 
+  const officialImageUrl = lookup?.imageUrl || null;
+
+  // ── Number verification: compare scanned number vs number on the official image
+  let numberVerification = null;
+  if (officialImageUrl && card.number) {
+    numberVerification = await verifyCardNumber(card, officialImageUrl);
+    // If the numbers don't match, trust the official image — it's the ground truth
+    if (numberVerification && !numberVerification.matches && numberVerification.officialNumber) {
+      console.log(`[verify] Correcting number: "${card.number}" → "${numberVerification.officialNumber}"`);
+    }
+  }
+
+  const verifiedNumber = (numberVerification && !numberVerification.matches && numberVerification.officialNumber)
+    ? numberVerification.officialNumber
+    : card.number;
+
   const result = {
     tcgplayer,
     ebay,
     cardkingdom: { available: false, retail: null, currency: 'USD', isEstimate: false },
-    // Bonus: include the official image from the same API call
-    officialImageUrl: lookup?.imageUrl || null
+    officialImageUrl,
+    // Number verification result — frontend uses this to show correction notice
+    numberVerification: numberVerification ? {
+      scannedNumber:  card.number,
+      officialNumber: numberVerification.officialNumber,
+      matches:        numberVerification.matches,
+      corrected:      numberVerification.corrected,
+      verifiedNumber  // the one to actually use
+    } : null
   };
 
   await cacheSet(cKey, result, 3600);
