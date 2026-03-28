@@ -222,15 +222,68 @@ async function lookupLorcana(card) {
   } catch (e) { console.log('[lorcana lookup]', e.message); return null; }
 }
 
-// Master lookup — returns unified result for any game
+// ── PriceCharting public search — works without API key, covers ALL TCGs ─────
+// Returns ungraded/loose price (closest to raw card market value)
+async function lookupPriceCharting(card) {
+  try {
+    const q = [card.name, card.set, card.number].filter(Boolean).join(' ');
+    const url = `https://www.pricecharting.com/api/product?q=${encodeURIComponent(q)}&type=prices`;
+    const r = await httpGet(url, { 'Accept': 'application/json' });
+    if (r.status !== 200) return null;
+    const data = JSON.parse(r.body);
+    // Response is either a single product or has a products array
+    const item = data.status === 'success' ? data :
+                 (data.products && data.products[0]) || null;
+    if (!item || item.status === 'error') return null;
+
+    // Prices are in cents — convert to dollars
+    // loose-price = ungraded market value (best for raw cards)
+    const loosePrice = item['loose-price'];
+    const market = (typeof loosePrice === 'number' && loosePrice > 0)
+      ? loosePrice / 100 : null;
+
+    console.log(`[pricecharting] found: ${item['product-name']} = $${market}`);
+    return {
+      imageUrl:  null, // PriceCharting doesn't serve card images
+      tcgmarket: market,
+      tcglow:    null,
+      tcghigh:   null,
+      currency:  'USD',
+      source:    'PriceCharting'
+    };
+  } catch (e) { console.log('[pricecharting]', e.message); return null; }
+}
+
+// Master lookup — tries primary API then PriceCharting as universal fallback
 async function lookupCard(card) {
   const game = (card.game || '').toLowerCase();
-  if (game.includes('pokemon'))                                   return lookupPokemon(card);
-  if (game.includes('magic'))                                     return lookupScryfall(card);
-  if (game.includes('yu-gi-oh') || game.includes('yugioh'))      return lookupYGO(card);
-  if (game.includes('lorcana'))                                   return lookupLorcana(card);
-  // Unknown game: try Scryfall as catch-all (handles many TCGs)
-  return lookupScryfall(card);
+  let result = null;
+
+  if (game.includes('pokemon'))                              result = await lookupPokemon(card);
+  else if (game.includes('magic'))                           result = await lookupScryfall(card);
+  else if (game.includes('yu-gi-oh') || game.includes('yugioh')) result = await lookupYGO(card);
+  else if (game.includes('lorcana'))                         result = await lookupLorcana(card);
+  else                                                       result = await lookupScryfall(card);
+
+  // If primary lookup found a price, use it (even if no image)
+  if (result?.tcgmarket != null) return result;
+
+  // Primary had no price — try PriceCharting as universal fallback
+  const pc = await lookupPriceCharting(card);
+  if (pc) {
+    // Merge: keep image from primary lookup if we got one, use PC price
+    return {
+      imageUrl:  result?.imageUrl || null,
+      tcgmarket: pc.tcgmarket,
+      tcglow:    null,
+      tcghigh:   null,
+      currency:  'USD',
+      source:    pc.source
+    };
+  }
+
+  // Return whatever primary found (may just have image, no price)
+  return result;
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
