@@ -32,7 +32,7 @@ function cacheSet(key, data) { cache.set(key, { ts: Date.now(), data }); }
 // ─── Rate limiting (per IP — simple sliding window) ──────────────────────────
 const rateMap = new Map();
 const RATE_WINDOW = 60_000;   // 1 minute
-const RATE_LIMIT  = 20;       // scans per minute per IP
+const RATE_LIMIT  = 60;       // requests per minute per IP
 
 function checkRate(ip) {
   const now  = Date.now();
@@ -232,7 +232,7 @@ If not found: {"available":false,"buylist":null,"retail":null,"currency":"USD"}`
 // ═════════════════════════════════════════════════════════════════════════════
 // HELPER: agentic web search loop
 // ═════════════════════════════════════════════════════════════════════════════
-async function agenticSearch(systemPrompt, userPrompt, maxIter = 10) {
+async function agenticSearch(systemPrompt, userPrompt, maxIter = 6) {
   const tools = [{ type: 'web_search_20250305', name: 'web_search' }];
   let messages = [{ role: 'user', content: userPrompt }];
   let finalText = '';
@@ -240,12 +240,13 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 10) {
   for (let i = 0; i < maxIter; i++) {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 4000,
+      max_tokens: 2000,
       system: systemPrompt,
       tools,
       messages
     });
 
+    // Collect text from this turn
     const textBlocks = response.content.filter(b => b.type === 'text');
     if (textBlocks.length) finalText = textBlocks.map(b => b.text).join('');
 
@@ -254,13 +255,28 @@ async function agenticSearch(systemPrompt, userPrompt, maxIter = 10) {
     if (response.stop_reason === 'tool_use') {
       const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
       if (!toolUseBlocks.length) break;
+
+      // Add the full assistant message (including tool_use blocks) to history
       messages.push({ role: 'assistant', content: response.content });
-      const toolResults = toolUseBlocks.map(b => ({
-        type: 'tool_result',
-        tool_use_id: b.id,
-        content: 'Search completed. Use the results to answer the question.'
-      }));
-      messages.push({ role: 'user', content: toolResults });
+
+      // The web_search tool results are already embedded in response.content
+      // as tool_result blocks — pass them back as-is so Claude can read them
+      const toolResultBlocks = response.content.filter(b => b.type === 'tool_result');
+
+      if (toolResultBlocks.length) {
+        // Real results came back inline — add them as a user turn
+        messages.push({ role: 'user', content: toolResultBlocks });
+      } else {
+        // Fallback: acknowledge each tool use so the loop can continue
+        messages.push({
+          role: 'user',
+          content: toolUseBlocks.map(b => ({
+            type: 'tool_result',
+            tool_use_id: b.id,
+            content: 'No results returned for this search.'
+          }))
+        });
+      }
       continue;
     }
     break;
