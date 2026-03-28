@@ -136,7 +136,7 @@ app.post('/prices', async (req, res) => {
   try {
     // Use Claude with web search to fetch prices from all 3 sources simultaneously
     const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5',
+      model: 'claude-sonnet-4-6',
       max_tokens: 2000,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{
