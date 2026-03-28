@@ -70,7 +70,7 @@ app.post('/identify', async (req, res) => {
   try {
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5',
-      max_tokens: 800,
+      max_tokens: 400,
       messages: [{
         role: 'user',
         content: [
@@ -119,8 +119,7 @@ If you cannot identify it:
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ROUTE: POST /prices
-// Body: { card: { name, game, set, number, rarity, extra, tcgplayerQuery, ebayQuery, cardmarketQuery } }
-// Returns prices from all 3 sources
+// Runs all 3 source lookups in parallel for maximum speed
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/prices', async (req, res) => {
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
@@ -133,92 +132,93 @@ app.post('/prices', async (req, res) => {
   const cached = cacheGet(cacheKey);
   if (cached) return res.json({ ...cached, cached: true });
 
-  // eBay region config
   const ebayRegions = {
-    AU: { domain: 'ebay.com.au',  currency: 'AUD', label: 'eBay Australia' },
-    US: { domain: 'ebay.com',     currency: 'USD', label: 'eBay USA' },
-    UK: { domain: 'ebay.co.uk',   currency: 'GBP', label: 'eBay UK' },
-    CA: { domain: 'ebay.ca',      currency: 'CAD', label: 'eBay Canada' },
-    DE: { domain: 'ebay.de',      currency: 'EUR', label: 'eBay Germany' },
-    JP: { domain: 'ebay.com',     currency: 'JPY', label: 'eBay Japan (via .com)' },
+    AU: { domain: 'ebay.com.au', currency: 'AUD', label: 'eBay Australia' },
+    US: { domain: 'ebay.com',    currency: 'USD', label: 'eBay USA' },
+    UK: { domain: 'ebay.co.uk',  currency: 'GBP', label: 'eBay UK' },
+    CA: { domain: 'ebay.ca',     currency: 'CAD', label: 'eBay Canada' },
+    DE: { domain: 'ebay.de',     currency: 'EUR', label: 'eBay Germany' },
+    JP: { domain: 'ebay.com',    currency: 'JPY', label: 'eBay Japan (via .com)' },
   };
   const ebayConf = ebayRegions[ebayRegion] || ebayRegions['AU'];
 
-  // Card Kingdom covers MTG, Pokemon, Yu-Gi-Oh, Lorcana etc.
-  const ckQuery = `${card.name} ${card.set || ''} site:cardkingdom.com`;
+  // ── Search functions — each runs independently in parallel ──────────────────
 
-  const systemPrompt = `You are a trading card price research assistant. 
-Search for real current prices using web search, then respond ONLY with a JSON object — no explanation, no markdown fences.
-Always attempt all three searches before responding.`;
+  async function searchTCGPlayer() {
+    const cKey = `tcg:${card.name}:${card.set}:${card.number}`;
+    const hit = cacheGet(cKey);
+    if (hit) return hit;
+    try {
+      const text = await agenticSearch(
+        'You are a trading card price researcher. Search and respond ONLY with JSON, no markdown.',
+        `Search TCGPlayer for the current price of this card:
+Card: ${card.name}, Set: ${card.set || ''}, Number: ${card.number || ''}, Rarity: ${card.rarity || ''}
+Search: "${card.tcgplayerQuery || card.name} tcgplayer"
 
-  const userPrompt = `Find current market prices for this trading card from three sources.
-
-Card: ${card.name}
-Game: ${card.game}
-Set: ${card.set || 'unknown'}
-Number: ${card.number || ''}
-Rarity: ${card.rarity || ''}
-Special: ${card.extra || ''}
-
-Do three separate web searches:
-1. "${card.tcgplayerQuery || card.name} tcgplayer price"
-2. "${card.ebayQuery || card.name} ${ebayConf.domain} sold"
-3. "${card.name} ${card.set || ''} card kingdom price"
-
-After searching, respond with ONLY this JSON structure (no markdown, no explanation):
-{
-  "tcgplayer": {
-    "available": true,
-    "low": 5.00,
-    "mid": 8.00,
-    "high": 12.00,
-    "market": 7.50,
-    "currency": "USD",
-    "url": "https://www.tcgplayer.com/..."
-  },
-  "ebay": {
-    "available": true,
-    "recentSales": [
-      {"title": "card name listing", "price": 10.00, "currency": "${ebayConf.currency}", "date": "2025-03", "condition": "Near Mint"}
-    ],
-    "low": 8.00,
-    "avg": 11.00,
-    "high": 15.00,
-    "currency": "${ebayConf.currency}",
-    "region": "${ebayRegion}",
-    "regionLabel": "${ebayConf.label}",
-    "url": "https://www.${ebayConf.domain}/..."
-  },
-  "cardkingdom": {
-    "available": true,
-    "buylist": 3.00,
-    "retail": 8.00,
-    "currency": "USD",
-    "url": "https://www.cardkingdom.com/..."
+Respond ONLY with this JSON:
+{"available":true,"low":5.00,"mid":8.00,"high":12.00,"market":7.50,"currency":"USD","url":"https://www.tcgplayer.com/..."}
+If not found: {"available":false,"low":null,"mid":null,"high":null,"market":null,"currency":"USD"}`, 5
+      );
+      const result = parseJSON(text) || { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' };
+      cacheSet(cKey, result);
+      return result;
+    } catch { return { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' }; }
   }
-}
-If a source has no data, set "available": false and all prices to null.`;
+
+  async function searchEbay() {
+    const cKey = `ebay:${card.name}:${card.set}:${card.number}:${ebayRegion}`;
+    const hit = cacheGet(cKey);
+    if (hit) return hit;
+    try {
+      const text = await agenticSearch(
+        'You are a trading card price researcher. Search eBay sold listings and respond ONLY with JSON, no markdown.',
+        `Search ${ebayConf.label} sold listings for this card:
+Card: ${card.name}, Set: ${card.set || ''}, Number: ${card.number || ''}
+Search: "${card.ebayQuery || card.name} ${ebayConf.domain} sold"
+
+Respond ONLY with this JSON:
+{"available":true,"recentSales":[{"title":"","price":0,"currency":"${ebayConf.currency}","date":"","condition":""}],"low":8.00,"avg":11.00,"high":15.00,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}","url":"https://www.${ebayConf.domain}/..."}
+If not found: {"available":false,"recentSales":[],"low":null,"avg":null,"high":null,"currency":"${ebayConf.currency}","region":"${ebayRegion}","regionLabel":"${ebayConf.label}"}`, 5
+      );
+      const result = parseJSON(text) || { available: false, recentSales: [], low: null, avg: null, high: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label };
+      result.region      = ebayRegion;
+      result.regionLabel = ebayConf.label;
+      result.currency    = result.currency || ebayConf.currency;
+      cacheSet(cKey, result);
+      return result;
+    } catch { return { available: false, recentSales: [], low: null, avg: null, high: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label }; }
+  }
+
+  async function searchCardKingdom() {
+    const cKey = `ck:${card.name}:${card.set}`;
+    const hit = cacheGet(cKey);
+    if (hit) return hit;
+    try {
+      const text = await agenticSearch(
+        'You are a trading card price researcher. Search Card Kingdom and respond ONLY with JSON, no markdown.',
+        `Search Card Kingdom for the current retail and buylist price of this card:
+Card: ${card.name}, Set: ${card.set || ''}
+Search: "${card.name} ${card.set || ''} card kingdom"
+
+Respond ONLY with this JSON:
+{"available":true,"buylist":3.00,"retail":8.00,"currency":"USD","url":"https://www.cardkingdom.com/..."}
+If not found: {"available":false,"buylist":null,"retail":null,"currency":"USD"}`, 5
+      );
+      const result = parseJSON(text) || { available: false, buylist: null, retail: null, currency: 'USD' };
+      cacheSet(cKey, result);
+      return result;
+    } catch { return { available: false, buylist: null, retail: null, currency: 'USD' }; }
+  }
 
   try {
-    const finalText = await agenticSearch(systemPrompt, userPrompt, 8);
+    // Run all 3 in parallel — total time = slowest single search, not sum of all 3
+    const [tcgplayer, ebay, cardkingdom] = await Promise.all([
+      searchTCGPlayer(),
+      searchEbay(),
+      searchCardKingdom()
+    ]);
 
-    let prices = parseJSON(finalText);
-
-    if (!prices) {
-      prices = {
-        tcgplayer:   { available: false, low: null, mid: null, high: null, market: null, currency: 'USD' },
-        ebay:        { available: false, recentSales: [], low: null, avg: null, high: null, currency: ebayConf.currency, region: ebayRegion, regionLabel: ebayConf.label },
-        cardkingdom: { available: false, buylist: null, retail: null, currency: 'USD' }
-      };
-    }
-
-    // Always stamp region info in case model omitted it
-    if (prices.ebay) {
-      prices.ebay.region      = ebayRegion;
-      prices.ebay.regionLabel = ebayConf.label;
-      prices.ebay.currency    = prices.ebay.currency || ebayConf.currency;
-    }
-
+    const prices = { tcgplayer, ebay, cardkingdom };
     cacheSet(cacheKey, prices);
     return res.json(prices);
 
@@ -227,6 +227,7 @@ If a source has no data, set "available": false and all prices to null.`;
     return res.status(500).json({ error: err.message || 'Price lookup failed.' });
   }
 });
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // HELPER: agentic web search loop
