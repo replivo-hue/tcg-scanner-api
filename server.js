@@ -313,44 +313,49 @@ app.post('/identify', async (req, res) => {
   if (!imageBase64) return res.status(400).json({ error: 'No image provided.' });
 
   const len = imageBase64.length;
-  const cKey = 'id6:' + imageBase64.slice(0,16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
+  const cKey = 'id7:' + imageBase64.slice(0,16) + imageBase64.slice(Math.floor(len/2), Math.floor(len/2)+16) + imageBase64.slice(-16);
   const cached = await cacheGet(cKey);
   if (cached) return res.json({ ...cached, cached: true });
 
   try {
-    // ── PASS 1: Force Claude to observe everything before committing ──────────
-    // By making it describe what it sees first, it can't skip straight to guessing.
-    // This observation step dramatically reduces hallucinated numbers and set names.
-    const obs = await withRetry(() => anthropic.messages.create({
+    // ── PASS 1: Observation — force Claude to read every part of the card ─────
+    // Sending the image ONCE with a description-only prompt.
+    // Crucially: we ask it to READ TEXT literally, not identify the card yet.
+    // This prevents it jumping straight to "Mew → must be SV 232/232".
+    const obsResp = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
-      max_tokens: 600,
+      max_tokens: 1000,
       messages: [{
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-          { type: 'text', text: `Look at this trading card image carefully. Before identifying it, describe exactly what you observe in each specific area. Be precise — only describe what you can actually see, not what you think it might be.
+          { type: 'text', text: `You are a document scanner, not a card identifier. Your only job right now is to READ and DESCRIBE what is physically printed on this card — do NOT try to identify or name the card yet.
 
-1. CARD BORDER & FRAME: What colour/style is the border? What does the overall frame layout look like?
-2. ARTWORK: Describe the illustration in detail — what creature/character/object is depicted, what colours, what setting?
-3. TOP TEXT (card name area): Spell out every character you can read at the top of the card.
-4. BOTTOM-RIGHT TEXT (card number): Read every digit and character in the bottom-right corner exactly as printed.
-5. BOTTOM TEXT (set name / copyright): Read the tiny text along the very bottom of the card.
-6. SET SYMBOL: Describe the shape/icon in the bottom-left corner.
-7. RARITY SYMBOL: Describe the small symbol next to the card number (circle, diamond, star, etc.).
-8. HP or ATK/DEF: What number appears for HP (top-right on Pokemon) or ATK/DEF (bottom of YGO)?
-9. SURFACE: Is the card foil/holographic/shiny, or flat?
-10. CONDITION: What do the card edges and surface look like?
+Report exactly what you can SEE for each area. If text is partially obscured, read what you can and note it. Do not fill in gaps from memory.
 
-Respond in plain text, one numbered point per line.` }
+1. BORDER COLOUR & LAYOUT: Describe the colour of the outer border and the overall card frame style.
+2. ARTWORK: Describe the creature/character/scene depicted — physical appearance, colours, pose, background.
+3. NAME TEXT (top of card): Transcribe every character printed at the top, letter by letter.
+4. HP / TYPE (top-right): What number and symbol appears in the top-right corner?
+5. CARD NUMBER (bottom-right): Transcribe the exact digits — e.g. "4/102" or "120/124". Read each digit individually.
+6. COPYRIGHT LINE (very bottom): Read the full copyright text printed at the very bottom edge.
+7. SET SYMBOL SHAPE (bottom-left): Describe the exact shape of the small icon — is it a flame, snowflake, sun, crown, sword, shield, star burst, leaf, wave, etc?
+8. RARITY SYMBOL: What shape is next to the card number — circle, diamond, star, two stars, three stars?
+9. CARD TYPE / ABILITIES TEXT: Read any ability names or attack names you can make out in the card body.
+10. SURFACE FINISH: Flat matte, holo, full-art rainbow holo, textured?
+
+Respond with numbered points only. Quote text exactly as printed.` }
         ]
       }]
     }));
 
-    const observations = obs.content.map(b => b.text || '').join('').trim();
-    if (!observations) throw new Error('Observation pass returned empty');
+    const observations = obsResp.content.map(b => b.text || '').join('').trim();
+    if (!observations) throw new Error('Observation pass empty');
+    console.log('[identify pass1]', observations.slice(0, 300));
 
-    // ── PASS 2: Commit to final identification using the observations ─────────
-    // Now Claude must cross-check its own observations against what's possible.
+    // ── PASS 2: Identification — continue the SAME conversation ──────────────
+    // The image is already in context. We just add the commit instruction.
+    // Claude cannot re-hallucinate because it's constrained by its own observations.
     const response = await withRetry(() => anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 500,
@@ -359,51 +364,55 @@ Respond in plain text, one numbered point per line.` }
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-            { type: 'text', text: `Look at this trading card image carefully. Before identifying it, describe exactly what you observe in each specific area. Be precise — only describe what you can actually see, not what you think it might be.
+            { type: 'text', text: `You are a document scanner, not a card identifier. Your only job right now is to READ and DESCRIBE what is physically printed on this card — do NOT try to identify or name the card yet.
 
-1. CARD BORDER & FRAME: What colour/style is the border? What does the overall frame layout look like?
-2. ARTWORK: Describe the illustration in detail — what creature/character/object is depicted, what colours, what setting?
-3. TOP TEXT (card name area): Spell out every character you can read at the top of the card.
-4. BOTTOM-RIGHT TEXT (card number): Read every digit and character in the bottom-right corner exactly as printed.
-5. BOTTOM TEXT (set name / copyright): Read the tiny text along the very bottom of the card.
-6. SET SYMBOL: Describe the shape/icon in the bottom-left corner.
-7. RARITY SYMBOL: Describe the small symbol next to the card number (circle, diamond, star, etc.).
-8. HP or ATK/DEF: What number appears for HP (top-right on Pokemon) or ATK/DEF (bottom of YGO)?
-9. SURFACE: Is the card foil/holographic/shiny, or flat?
-10. CONDITION: What do the card edges and surface look like?
+Report exactly what you can SEE for each area. If text is partially obscured, read what you can and note it. Do not fill in gaps from memory.
 
-Respond in plain text, one numbered point per line.` }
+1. BORDER COLOUR & LAYOUT: Describe the colour of the outer border and the overall card frame style.
+2. ARTWORK: Describe the creature/character/scene depicted — physical appearance, colours, pose, background.
+3. NAME TEXT (top of card): Transcribe every character printed at the top, letter by letter.
+4. HP / TYPE (top-right): What number and symbol appears in the top-right corner?
+5. CARD NUMBER (bottom-right): Transcribe the exact digits — e.g. "4/102" or "120/124". Read each digit individually.
+6. COPYRIGHT LINE (very bottom): Read the full copyright text printed at the very bottom edge.
+7. SET SYMBOL SHAPE (bottom-left): Describe the exact shape of the small icon — is it a flame, snowflake, sun, crown, sword, shield, star burst, leaf, wave, etc?
+8. RARITY SYMBOL: What shape is next to the card number — circle, diamond, star, two stars, three stars?
+9. CARD TYPE / ABILITIES TEXT: Read any ability names or attack names you can make out in the card body.
+10. SURFACE FINISH: Flat matte, holo, full-art rainbow holo, textured?
+
+Respond with numbered points only. Quote text exactly as printed.` }
           ]
         },
+        // Inject Pass 1 observations as the assistant turn — Claude must honour these
         { role: 'assistant', content: observations },
         {
           role: 'user',
-          content: `Based on your observations above, now identify the card precisely.
+          content: `Now use ONLY what you transcribed above to identify this card. Do not add information from memory that contradicts your observations.
 
-CROSS-CHECK RULES before committing:
-- The card name from TEXT (point 3) must match what the ARTWORK (point 2) shows — if they conflict, trust the text
-- The card number (point 4) must be physically possible for the set (e.g. 4/102 means set has 102 cards — a number higher than the total is a misread)
-- Use the artwork description to confirm the card name if the text was unclear
-- The set name (point 5) and set symbol (point 6) must be consistent with each other
-- If a field was unclear in your observations, set it to null — never guess
+RULES:
+- "name" = exactly what you read in point 3 (name text)
+- "number" = exactly what you read in point 5 — if you read "120/124" write "120/124", not something else
+- "set" = derive from copyright line (point 6) and set symbol shape (point 7) together
+- If your observed number exceeds the set total (e.g. you wrote 232/124) that is a misread — set number to null
+- "extra" = Full Art if the artwork covers the whole card; Secret Rare only if number exceeds the set's printed total
+- Set any field to null if your observations were unclear — never substitute from memory
 
 Respond ONLY with valid JSON, no markdown:
 {
-  "name": "exact card name matching your text observation",
+  "name": "from point 3",
   "game": "Pokemon | Magic: The Gathering | Yu-Gi-Oh! | Lorcana | One Piece | Flesh and Blood | Sports | Other",
-  "set": "exact set name from bottom text, or null",
-  "number": "exact number from bottom-right, or null",
-  "rarity": "rarity from symbol description, or null",
-  "year": "copyright year or null",
+  "set": "derived from points 6 and 7, or null",
+  "number": "from point 5, or null",
+  "rarity": "from point 8, or null",
+  "year": "from copyright in point 6, or null",
   "condition": "Mint | Near Mint | Lightly Played | Moderately Played | Heavily Played",
   "foil": true or false,
-  "extra": "1st Edition | Shadowless | Full Art | Alt Art | Secret Rare | Promo | null",
+  "extra": "Full Art | Alt Art | Secret Rare | 1st Edition | Shadowless | Promo | null",
   "confidence": "high | medium | low",
   "tcgplayerQuery": "name set number",
-  "ebayQuery": "name set number rarity for eBay sold listings",
+  "ebayQuery": "name set number for eBay sold listings",
   "cardmarketQuery": "name set"
 }
-If not a card or too blurry to identify at all: {"error":"Cannot identify card"}`
+If image is not a trading card or completely unreadable: {"error":"Cannot identify card"}`
         }
       ]
     }));
@@ -413,7 +422,6 @@ If not a card or too blurry to identify at all: {"error":"Cannot identify card"}
     try { card = JSON.parse(raw); }
     catch { card = parseJSON(raw) || { error: 'Could not parse response.' }; }
 
-    // Cache the result — but only 6hrs (not 24hrs) so corrections propagate faster
     if (!card.error) await cacheSet(cKey, card, 21600);
     return res.json(card);
   } catch (err) {
